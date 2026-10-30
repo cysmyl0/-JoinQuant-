@@ -24,6 +24,8 @@
       最高价之前的重合不算 / 单根2倍量整根算 / 没有放量K线则无
  16  卖出逻辑：T+1、止损、止盈
  17  持仓放量减仓：当日量 > 2×MA10 才减、1/3 取整到 100 股、不足 2 手不减
+ 18  急跌三条口径：首尾相接不算 / 跳空才算 / 第一根不足1%且没破前低不算 /
+      破了前低就算 / 跌停板豁免缺口
 """
 
 import os
@@ -71,13 +73,13 @@ def bar(o, c, vol=1500.0):
     return (o, c, h, l, vol)
 
 
-# 基础下跌结构：30 根横盘 + 4 根下跌，第 4 根（idx33）是有效大阴线
-# （detect_setup 要求至少 20 根日线，所以前置 pad 用 30 根）
+# 基础下跌结构：30 根横盘 + 4 根跳空急跌（每根实体之间都有 1% 以上的缺口），
+# 第 4 根（idx33）是有效大阴线。缺口是原文"实体不重叠超过1%"的要求（REQUIRE_GAP）。
 BASE = pad(30) + [
-    bar(28.00, 27.10),   # idx30 跌
-    bar(27.00, 26.10),   # idx31 跌（与前根实体重叠）
-    bar(26.20, 25.20),   # idx32 跌（与前根实体重叠，不是 L）
-    bar(24.90, 24.00),   # idx33 有效大阴线：跌幅3.75%，间隙0.30 > 0.01×24.00=0.24
+    bar(28.00, 27.10),   # idx30 跌 -3.2%（第一根，跌幅>1%）
+    bar(26.80, 26.10),   # idx31 跌，缺口 27.10-26.80=0.30 > 0.01×26.10=0.261
+    bar(25.80, 25.20),   # idx32 跌，缺口 26.10-25.80=0.30 > 0.01×25.20=0.252
+    bar(24.90, 24.00),   # idx33 有效大阴线：缺口 25.20-24.90=0.30 > 0.24
 ]
 L_IDX = 33
 L_PRICE = 24.90
@@ -272,6 +274,47 @@ def run():
     check('17i 150股（不足2手）→ 不减', S.reduce_shares(150) == 0)
     check('17j 300股减完还剩200股（不会清仓）',
           S.reduce_shares(300) < 300 and 300 - S.reduce_shares(300) > 0)
+
+    print('\n[18] 急跌三条口径（可开关）')
+    g0, f0 = S.REQUIRE_GAP, S.REQUIRE_FIRST_DROP
+    try:
+        # 18a/18b 首尾相接（实体零缺口）三连阴：按原文不算急跌，关掉缺口要求才算
+        o, c, h, l, v = mk(pad(5, price=30.0) +
+                           [bar(30.00, 29.60), bar(29.60, 29.20), bar(29.20, 28.80)])
+        S.REQUIRE_GAP = True
+        check('18a 首尾相接无缺口 → 不算急跌', S.is_sharp_decline(o, c, 7) is False)
+        S.REQUIRE_GAP = False
+        check('18b 关掉缺口要求 → 算急跌', S.is_sharp_decline(o, c, 7) is True)
+        S.REQUIRE_GAP = True
+
+        # 18c 跳空三连阴（每根之间实体缺口 > 1%）→ 算
+        o, c, h, l, v = mk(pad(5, price=30.0) +
+                           [bar(29.50, 29.00), bar(28.60, 28.10), bar(27.70, 27.20)])
+        check('18c 跳空三连阴 → 算急跌', S.is_sharp_decline(o, c, 7) is True)
+
+        # 18d/18e 跳空三连阴，但第一根只跌 0.34% 且没破前低
+        rise = [bar(28.00 + 0.10 * i, 28.00 + 0.10 * i) for i in range(20)]
+        o, c, h, l, v = mk(rise +
+                           [bar(29.90, 29.80), bar(29.50, 29.20), bar(28.90, 28.60)])
+        S.REQUIRE_FIRST_DROP = True
+        check('18d 第一根跌幅<1%且没破前低 → 不算',
+              S.is_sharp_decline(o, c, 22) is False)
+        S.REQUIRE_FIRST_DROP = False
+        check('18e 关掉第一根要求 → 算急跌', S.is_sharp_decline(o, c, 22) is True)
+        S.REQUIRE_FIRST_DROP = True
+
+        # 18f 第一根只跌 0.67%，但收盘破了前 20 根最低收盘 → 算
+        o, c, h, l, v = mk(pad(20, price=30.0) +
+                           [bar(30.00, 29.80), bar(29.50, 29.10), bar(28.80, 28.40)])
+        check('18f 第一根跌0.67%但破前低 → 算急跌',
+              S.is_sharp_decline(o, c, 22) is True)
+
+        # 18g 三根跌停板（实体完全重叠，零缺口）→ 跌停豁免 → 算
+        o, c, h, l, v = mk(pad(5, price=30.0) +
+                           [bar(30.00, 27.00), bar(27.00, 24.30), bar(24.30, 21.87)])
+        check('18g 跌停板豁免缺口 → 算急跌', S.is_sharp_decline(o, c, 7) is True)
+    finally:
+        S.REQUIRE_GAP, S.REQUIRE_FIRST_DROP = g0, f0
 
     print('\n' + '=' * 60)
     total = PASSED[0] + len(FAILED)

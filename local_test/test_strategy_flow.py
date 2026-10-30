@@ -56,9 +56,9 @@ def build_history():
     for i in (5, 6, 7):                 # 三根放量横盘 → 28.00 成为强压力区
         rows[i] = (28.0, 28.0, 28.05, 27.95, 2000.0)
     rows += [
-        bar(28.00, 27.10),              # 53 跌
-        bar(27.00, 26.10),              # 54 跌
-        bar(26.20, 25.20),              # 55 跌
+        bar(28.00, 27.10),              # 53 跌（第一根，-3.2%）
+        bar(26.80, 26.10),              # 54 跌，缺口 0.30 > 1%×26.10
+        bar(25.80, 25.20),              # 55 跌，缺口 0.30 > 1%×25.20
         bar(24.90, 24.00),              # 56 有效大阴线  L = 24.90
         bar(24.30, 24.30),              # 57 反抽
         bar(24.05, 24.05),              # 58
@@ -198,7 +198,7 @@ def make_env(now_price, now_vol, today, yesterday):
     S.history = history
     S.attribute_history = attribute_history
     S.get_all_securities = get_all_securities
-    S.get_index_stocks = lambda *a, **k: []
+    S.get_index_stocks = lambda *a, **k: [CODE]   # 沪深300 成分股 → 就这一只测试股
     S.order_target_value = order_target_value
     S.order_target = order_target
     S.run_daily = run_daily

@@ -39,7 +39,10 @@
        - 同一条规则可以多次触发：每次放量都是再卖 1/3（按当时的剩余持仓算）
 
 【用户已默认接受的实现假设（可在一处改）】
-- 急跌条件（原文字面"至少三根K线下跌比较猛"）：L 及之前连续收跌 ≥ 3 根，且区间累计跌幅 ≥ 3%
+- 急跌条件（原文三条，逐条落到代码里，后两条可用开关关掉）：
+    ① 至少 3 根连续收跌，且区间累计跌幅 ≥ 3%（把"下跌比较猛"量化）
+    ② 段内每相邻两根K线实体不重叠 > 1% 股价（跳空下跌），跌停板豁免   ← REQUIRE_GAP
+    ③ 第一根跌幅 > 1% 或 收盘破前 20 根最低收盘                        ← REQUIRE_FIRST_DROP
 - A 股 1 手 = 100 股，手工取整；单票仓位上限 25%，最多同时持有 5 只
 - 卖出遇到跌停（价格 ≤ 跌停价×1.001）、买入遇到涨停（价格 ≥ 涨停价×0.999）则放弃该笔
 ================================================================================
@@ -71,7 +74,10 @@ VOL_L        = 10       # 长均量 10 日
 VOL_CAP      = 2.0      # 2 倍量
 RR_MIN       = 2.0      # 盈亏比 2:1
 DECLINE_BARS = 3        # 急跌：至少连续下跌根数
-DECLINE_PCT  = 0.03     # 急跌：累计跌幅至少 3%
+DECLINE_PCT  = 0.03     # 急跌：累计跌幅至少 3%（把原文"下跌比较猛"量化）
+REQUIRE_GAP        = True   # 急跌：下跌段每相邻两根K线实体必须不重叠 >1%（跳空下跌），跌停豁免
+REQUIRE_FIRST_DROP = True   # 急跌：下跌段第一根跌幅 >1% 或 收盘破前低
+FIRST_DROP_BACK    = 20     # "破前低"参照的前 N 根最低收盘价
 LOOKBACK_L   = 10       # 只在最近 10 根里找有效大阴线 L（否则 L 太老无意义）
 HIGH_BACK    = 250      # 往前找"上一个最高价"的回溯根数（压力区窗口 = 最高价那根 → 昨天）
 
@@ -154,22 +160,71 @@ def find_L(o, c, lookback=LOOKBACK_L):
     return None
 
 
+def decline_run_start(c, L_idx):
+    """
+    从 L 往回找"连续收跌"段的起点：返回段内第一根的索引。
+    段内每根都满足 close[t] < close[t-1]，一直连到 close=close 或 收涨 为止。
+    """
+    j = L_idx
+    while j >= 1 and c[j] < c[j - 1]:
+        j -= 1
+    return j + 1
+
+
+def has_body_gaps(o, c, start, end):
+    """
+    下跌段 [start, end] 内，每相邻两根K线的实体都不重叠（间隙 > 1% 股价）。
+    跌停板豁免（原文"跌停板可以除外"）。
+    """
+    for t in range(start + 1, end + 1):
+        gap = body_low(o, c, t - 1) - body_top(o, c, t)
+        if gap <= PCT * c[t] and not is_limit_down(c, t):
+            return False
+    return True
+
+
+def first_bar_sharp(o, c, start, back=FIRST_DROP_BACK):
+    """
+    下跌段第一根：跌幅 > 1% 或 收盘破前低（前 back 根的最低收盘）。
+    原文："第一根 k 线下跌幅度是超过股价的 1% 或者破前低"。
+    """
+    if start < 1:
+        drop_ok = (o[start] - c[start]) / c[start] > PCT
+    else:
+        drop_ok = (c[start - 1] - c[start]) / c[start] > PCT
+    if drop_ok:
+        return True
+    lo = max(0, start - back)
+    if lo >= start:
+        return False
+    return float(c[start]) < float(np.min(c[lo:start]))
+
+
 def is_sharp_decline(o, c, L_idx):
     """
-    急跌判定：L 及之前连续收跌 ≥ DECLINE_BARS 根，且该段累计跌幅 ≥ DECLINE_PCT。
-    这是对原文"至少三根K线下跌比较猛"的量化。
+    急跌判定（按原文三条，可开关）：
+      ① 至少 DECLINE_BARS 根连续收跌，且累计跌幅 ≥ DECLINE_PCT（"下跌比较猛"）
+      ② REQUIRE_GAP=True 时：段内每相邻两根实体不重叠 > 1% 股价（跳空下跌，跌停豁免）
+      ③ REQUIRE_FIRST_DROP=True 时：第一根跌幅 > 1% 或 破前低
     """
     if L_idx < 1:
         return False
-    j = L_idx
-    cnt = 0
-    while j >= 1 and c[j] < c[j - 1]:
-        cnt += 1
-        j -= 1
+
+    start = decline_run_start(c, L_idx)
+    cnt = L_idx - start + 1
     if cnt < DECLINE_BARS:
         return False
-    drop = float(c[L_idx]) / float(c[j]) - 1.0
-    return bool((-drop) >= DECLINE_PCT)
+
+    ref = float(c[start - 1]) if start >= 1 else float(c[start])
+    drop = float(c[L_idx]) / ref - 1.0
+    if (-drop) < DECLINE_PCT:
+        return False
+
+    if REQUIRE_GAP and not has_body_gaps(o, c, start, L_idx):
+        return False
+    if REQUIRE_FIRST_DROP and not first_bar_sharp(o, c, start):
+        return False
+    return True
 
 
 def slow_run_ok(c, L_idx, n=None):
@@ -818,6 +873,8 @@ def _do_buy(context, today, picks):
 # 跌停板可以除外                            is_valid_bear() 的 is_limit_down()
 # 倒数第二根阴线 → L                        find_L() 最后一根有效大阴线，L = open
 # 至少三根K线下跌比较猛                      is_sharp_decline()：连跌≥3根且累计≥3%
+# 段内实体互不重叠（跳空下跌）               has_body_gaps()，REQUIRE_GAP 开关
+# 第一根跌幅>1%或破前低                     first_bar_sharp()，REQUIRE_FIRST_DROP 开关
 # 四根k线内完全站上                        detect_setup() 的窗口 wleft >= 0
 # 连续三根k线在1%以内算放缓                  slow_run_ok()：窗口放宽到 6 根
 # 同时不可以创新低                          no_new_low()：price >= p_low
