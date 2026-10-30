@@ -62,7 +62,7 @@ def build_history():
         bar(24.90, 24.00),              # 56 有效大阴线  L = 24.90
         bar(24.30, 24.30),              # 57 反抽
         bar(24.05, 24.05),              # 58
-        bar(24.35, 24.35),              # 59
+        bar(24.88, 24.88),              # 59 昨收 24.88（仍未站上 L=24.90）
     ]
     o = np.array([r[0] for r in rows], float)
     c = np.array([r[1] for r in rows], float)
@@ -151,9 +151,17 @@ def make_env(now_price, now_vol, today, yesterday):
         return {f: np.array(V[-k:], dtype=float) for f in (fields or ['volume'])}
 
     def get_all_securities(types=None, date=None):
-        return pd.DataFrame({'display_name': ['测试股'],
+        return pd.DataFrame({'display_name': [CURRENT.get('name', '测试股')],
                              'start_date': [datetime.date(2015, 1, 5)],
                              'end_date': [datetime.date(2030, 1, 1)]}, index=[CODE])
+
+    def get_extras(field, security_list, end_date=None, count=1, df=True):
+        assert field == 'is_st', field
+        if CURRENT.get('st_fail'):
+            raise RuntimeError('mock: get_extras 不可用')
+        codes = [security_list] if isinstance(security_list, str) else list(security_list)
+        st = CURRENT.get('st') or {}
+        return pd.DataFrame({c: [bool(st.get(c, False))] * int(count) for c in codes})
 
     def order_target_value(security, value):
         ORDERS.append(('buy', security, value))
@@ -198,7 +206,8 @@ def make_env(now_price, now_vol, today, yesterday):
     S.history = history
     S.attribute_history = attribute_history
     S.get_all_securities = get_all_securities
-    S.get_index_stocks = lambda *a, **k: [CODE]   # 沪深300 成分股 → 就这一只测试股
+    S.get_extras = get_extras
+    S.get_index_stocks = lambda *a, **k: [CODE]   # 中证500 成分股 → 就这一只测试股
     S.order_target_value = order_target_value
     S.order_target = order_target
     S.run_daily = run_daily
@@ -215,8 +224,12 @@ def make_env(now_price, now_vol, today, yesterday):
 CURRENT = {}
 
 
-def run_scenario(name, now_price, now_vol, cash=1000000.0):
+def run_scenario(name, now_price, now_vol, cash=1000000.0,
+                 st=None, st_fail=False, stock_name=None):
     del ORDERS[:]
+    CURRENT['st'] = st or {}
+    CURRENT['st_fail'] = st_fail
+    CURRENT['name'] = stock_name or '测试股'
     today = datetime.date(2024, 6, 3)
     yesterday = datetime.date(2024, 5, 31)
     make_env(now_price, now_vol, today, yesterday)
@@ -297,6 +310,23 @@ def main():
     check('F2 持仓不变 1000 股',
           pf.positions.get(CODE) is not None
           and pf.positions[CODE].total_amount == 1000, str(pf.positions))
+
+    print('\n[场景 G] 站上 L 但涨幅只有 0.28%（昨收 24.88）→ 不买')
+    ctx, pf = run_scenario('G', now_price=24.95, now_vol=1500.0)
+    check('G1 涨幅不足1%不买', len([x for x in ORDERS if x[0] == 'buy']) == 0, str(ORDERS))
+
+    print('\n[场景 H] 标的被 is_st 标成 ST → 剔除，不买')
+    ctx, pf = run_scenario('H', now_price=25.20, now_vol=1500.0, st={CODE: True})
+    check('H1 ST 股不买', len([x for x in ORDERS if x[0] == 'buy']) == 0, str(ORDERS))
+
+    print('\n[场景 I] is_st 接口失效 + 简称是"*ST测试股" → 按名称剔除，不买')
+    ctx, pf = run_scenario('I', now_price=25.20, now_vol=1500.0,
+                           st_fail=True, stock_name='*ST测试股')
+    check('I1 名称带 ST 不买', len([x for x in ORDERS if x[0] == 'buy']) == 0, str(ORDERS))
+
+    print('\n[场景 J] is_st 失效但简称正常 → 正常买入（不因为接口挂了就全禁）')
+    ctx, pf = run_scenario('J', now_price=25.20, now_vol=1500.0, st_fail=True)
+    check('J1 接口失效仍能买', len([x for x in ORDERS if x[0] == 'buy']) == 1, str(ORDERS))
 
     print('\n' + '=' * 60)
     total = PASSED[0] + len(FAILED)

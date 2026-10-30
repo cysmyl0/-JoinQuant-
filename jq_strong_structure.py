@@ -23,7 +23,10 @@
 4.  量能：MA5(VOL) < 当日 VOL < 2 × MA10(VOL)    ← 必须放量过 5 日均量，但不到 2 倍 10 日均量
        （MA5/MA10 取截至前一根已收盘K线的均量；当日 VOL 用 14:55 时点的当日累计量估计全日量）
 5.  不创新低：14:55 价 ≥ P_low，P_low = 从 L 到买入前一天的最低收盘价
+5b. 站上那根要够强：站上 L 的那根上涨K线，涨幅（相对前一天收盘）> 1%
+       ← 原文"（阴线的下跌值>1%的股价，上涨的k线也要>1%）"
 6.  盈亏比：目标 = 买入价上方最近的强压力区；盈亏比 = (目标 - 买入) / (买入 - P_low) 必须 ≥ 2
+       - 若买入价已经落在某压力区内（或正好压着下沿）→ 压力区太近，直接不买
 7.  强压力区：窗口 = 从【上一个最高价那根】一直数到【昨天】—— 整个下跌阶段都算
        - 窗口内 ≥ 3 根【放量K线】的价格区间 [最低价, 最高价] 有重合 → 重合的那一段就是强压力区
        - 价格区间用整根K线的最高/最低，**影线和实体都算**（不是只看收盘价）
@@ -31,7 +34,7 @@
        - 窗口内任意一根成交量 ≥ 2 × V0 → 这一根本身整段也算强压力区
        - 目标 = 买入价上方最近的那条压力区的【下沿】（价格第一次碰到压力区的价位）
 8.  否决项：成交量 ≥ 2 倍 10 日均量的 K 线（买入当天）不买
-9.  不用 ST / 市值 / 价格过滤
+9.  标的池：默认【中证500】成分股，剔除 ST / *ST、剔除停牌；不做市值/价格过滤
 10. 所有买入和卖出都在每天 14:55 执行（1 分钟级回测 + run_daily 定时任务）
 11. 持仓期间：某天成交量 > 2 × MA10(VOL)（与第 4 条同一条线的另一侧）→ 当天卖出 1/3 持仓
        - 先看止盈/止损，两者都没触发才减仓；同一天不会既减仓又清仓
@@ -73,6 +76,8 @@ VOL_S        = 5        # 短均量 5 日
 VOL_L        = 10       # 长均量 10 日
 VOL_CAP      = 2.0      # 2 倍量
 RR_MIN       = 2.0      # 盈亏比 2:1
+REQUIRE_STAND_GAIN = True  # 站上 L 的那根上涨K线，涨幅必须 > STAND_GAIN_PCT
+STAND_GAIN_PCT = 0.01   # 原文"上涨的k线也要>1%"
 DECLINE_BARS = 3        # 急跌：至少连续下跌根数
 DECLINE_PCT  = 0.03     # 急跌：累计跌幅至少 3%（把原文"下跌比较猛"量化）
 REQUIRE_GAP        = True   # 急跌：下跌段每相邻两根K线实体必须不重叠 >1%（跳空下跌），跌停豁免
@@ -82,8 +87,9 @@ LOOKBACK_L   = 10       # 只在最近 10 根里找有效大阴线 L（否则 L 
 HIGH_BACK    = 250      # 往前找"上一个最高价"的回溯根数（压力区窗口 = 最高价那根 → 昨天）
 
 # ---------- 选股 / 仓位 / 费率 ----------
-UNIVERSE     = 'hs300'    # 'all' 全市场(约5000只) | 'hs300' | 'zz500' | 'zz1000'
+UNIVERSE     = 'zz500'    # 'all' 全市场(约5000只) | 'hs300' | 'zz500'（默认） | 'zz1000'
 IDX_MAP      = {'hs300': '000300.XSHG', 'zz500': '000905.XSHG', 'zz1000': '000852.XSHG'}
+EXCLUDE_ST   = True     # True: 剔除 ST / *ST（用 get_extras('is_st') 判，取不到再看股票名称）
 MIN_LIST_DAYS = 500     # 上市满 500 个自然日（约 340 个交易日）才纳入
 BARS_SCAN    = 60       # 第一步扫描用日线根数（够算 detect_setup + 均量）
 BARS_FULL    = 300      # 第二轮算强压力区用日线根数（需覆盖 HIGH_BACK）
@@ -296,6 +302,7 @@ def detect_setup(o, c, h, l, v):
         'L': L, 'L_idx': Li, 'p_low': p_low,
         'wlen': wlen, 'wleft': wleft,
         'v5': v5, 'v10': v10,
+        'prev_close': float(c[-1]),        # 昨天收盘，用来算"站上那根的涨幅"
     }
 
 
@@ -420,22 +427,34 @@ def find_strong_zones(h, l, v, v0, back=HIGH_BACK, touch=3, vol_cap=VOL_CAP):
 
 def pick_target(zones, buy):
     """
-    买入价上方【最近】的强压力区价位；没有则 None。
-    - 若某压力区整段在买入价上方 → 取它的下沿（价格第一次碰到压力区的位置）
-    - 若买入价已经落在某个压力区里面 → 取该区上沿
+    买入价【上方最近】强压力区的下沿；没有 → None。
+    - 只认整个区间都在买入价上方的区（下沿 > 买入价）
+    - 买入价已经落在某个压力区内、或正好压着它的下沿 → 返回 None
+      （这就是原文"上一个强压力区很近"→不买，不硬凑一个目标价）
     """
     if not zones:
         return None
-    best = None
-    for lo, hi in zones:
-        if hi < buy:                 # 整段在下方，不是上方的压力
+    for lo, hi in sorted(zones):
+        if hi <= buy:        # 整段在买入价下方（或刚好在买入价）→ 不是上方压力
             continue
-        edge = lo if buy < lo else hi
-        if edge <= buy:
-            continue
-        if best is None or edge < best:
-            best = edge
-    return best
+        if lo <= buy:        # 买入价已经在区内 / 压着下沿 → 压力太近
+            return None
+        return lo            # 上方最近的压力区下沿
+    return None
+
+
+def stand_gain_ok(price, prev_close, need=STAND_GAIN_PCT):
+    """
+    站上 L 的那根上涨K线，涨幅（相对前一天收盘）必须 > need（默认 1%）。
+    原文："阴线的下跌值 > 1% 的股价，上涨的 k 线也要 > 1%"。
+    REQUIRE_STAND_GAIN=False 时此条不生效。
+    """
+    if not REQUIRE_STAND_GAIN:
+        return True
+    if price is None or prev_close is None or prev_close <= 0:
+        return False
+    gain = round(float(price) / float(prev_close) - 1.0, 10)   # 抹掉浮点误差
+    return gain > need
 
 
 def sell_allowed(buy_date, today):
@@ -525,8 +544,8 @@ def initialize(context):
 
     log.info('强势结构策略初始化完成 | 窗口: 无放缓%d根/有放缓%d根 | 盈亏比≥%.1f'
              % (W_NO_SLOW, W_SLOW, RR_MIN))
-    log.info('量能条件: MA%d < 当日量 < %.1f×MA%d | 标的池: %s'
-             % (VOL_S, VOL_CAP, VOL_L, UNIVERSE))
+    log.info('量能条件: MA%d < 当日量 < %.1f×MA%d | 标的池: %s | 剔除ST: %s'
+             % (VOL_S, VOL_CAP, VOL_L, UNIVERSE, '是' if EXCLUDE_ST else '否'))
 
     # 全流程统一在 14:55 执行
     run_daily(trade_1455, time='14:55')
@@ -592,6 +611,8 @@ def trade_1455(context):
             continue
         if not no_new_low(p, st['p_low']):          # 条件③：不创新低
             continue
+        if not stand_gain_ok(p, st.get('prev_close')):   # 条件④：站上那根涨幅 >1%
+            continue
         survivors.append((code, st, p, vt))
 
     if not survivors:
@@ -631,22 +652,80 @@ def trade_1455(context):
     _do_buy(context, today, picks)
 
 
+def is_st_name(name):
+    """
+    股票简称里带 ST 就算 ST（含 *ST、ST、S*ST 等写法）。
+    'ST' 出现位置不限，但要求是大写形式，避免把正常股票误伤。
+    """
+    if name is None:
+        return False
+    n = str(name).upper().replace(' ', '').replace('\u3000', '')
+    return 'ST' in n
+
+
+def strip_st(codes, names=None, st_flags=None):
+    """
+    剔除 ST / *ST。
+      codes      : 待过滤的股票列表
+      names      : {code: 股票简称}，可选
+      st_flags   : {code: True/False}，来自 get_extras('is_st')，可选；优先级高于 names
+    两个都没给时原样返回（无法判断就不乱删）。
+    """
+    names = names or {}
+    st_flags = st_flags or {}
+    out = []
+    for c in codes:
+        if EXCLUDE_ST:
+            if c in st_flags:
+                if bool(st_flags[c]):
+                    continue
+            elif is_st_name(names.get(c)):
+                continue
+        out.append(c)
+    return out
+
+
 def _get_universe(context):
-    """标的池：剔除停牌。不做 ST/市值/价格过滤（按你的要求）。"""
+    """标的池：指数成分股（默认中证500）→ 剔除 ST/*ST → 剔除停牌。不做市值/价格过滤。"""
     d = context.previous_date
+    codes = []
+    names = {}
     try:
+        # 全市场表：既用来取名称（判 ST），也在 UNIVERSE='all' 时当股票池
+        sec = None
+        try:
+            sec = get_all_securities(types=['stock'], date=d)
+            if sec is not None and len(sec) > 0 and 'display_name' in sec.columns:
+                names = dict(sec['display_name'])
+        except Exception as e:
+            log.warn('取股票名称失败，ST 判定改用 is_st: %s' % e)
+
         if UNIVERSE in IDX_MAP:
             codes = list(get_index_stocks(IDX_MAP[UNIVERSE], date=d))
         else:
-            df = get_all_securities(types=['stock'], date=d)
-            if len(df) == 0:
+            if sec is None or len(sec) == 0:
                 return []
             cutoff = pd.Timestamp(d) - pd.Timedelta(days=MIN_LIST_DAYS)
-            df = df[df['start_date'].apply(lambda x: pd.Timestamp(x) <= cutoff)]
-            codes = list(df.index)
+            sec = sec[sec['start_date'].apply(lambda x: pd.Timestamp(x) <= cutoff)]
+            codes = list(sec.index)
     except Exception as e:
         log.error('取标的池失败: %s' % e)
         return []
+
+    # ---------- 剔除 ST / *ST ----------
+    if EXCLUDE_ST and codes:
+        st_flags = {}
+        try:
+            ex = get_extras('is_st', codes, end_date=d, count=1)
+            if ex is not None and len(ex) > 0:
+                row = ex.iloc[-1]
+                st_flags = {str(k): bool(row[k]) for k in row.index}
+        except Exception as e:
+            log.warn("get_extras('is_st') 取不到，改用股票名称判 ST: %s" % e)
+        n0 = len(codes)
+        codes = strip_st(codes, names, st_flags)
+        if VERBOSE and n0 != len(codes):
+            log.info('剔除 ST/*ST %d 只（%d → %d）' % (n0 - len(codes), n0, len(codes)))
 
     cd = get_current_data()
     out = []
@@ -876,15 +955,16 @@ def _do_buy(context, today, picks):
 # 段内实体互不重叠（跳空下跌）               has_body_gaps()，REQUIRE_GAP 开关
 # 第一根跌幅>1%或破前低                     first_bar_sharp()，REQUIRE_FIRST_DROP 开关
 # 四根k线内完全站上                        detect_setup() 的窗口 wleft >= 0
+# 上涨的k线也要 >1%（站上那根的涨幅）        stand_gain_ok()，REQUIRE_STAND_GAIN 开关
 # 连续三根k线在1%以内算放缓                  slow_run_ok()：窗口放宽到 6 根
 # 同时不可以创新低                          no_new_low()：price >= p_low
 # 价格到达压力区就卖出                       should_sell()：price >= target
 # 不能买：两倍十日成交量的K线                volume_ok()：VOL 必须 < 2×MA10(VOL)
-# 上一个强压力区很近，盈亏比不满足2:1         risk_reward() >= 2.0
+# 上一个强压力区很近，盈亏比不满足2:1         risk_reward() >= 2.0；已在区内 → pick_target() 返回 None
 # 强压力区：同一股价三根放量K线               find_strong_zones() touch=3（价格区间重合≥3根）
 # 影线也算，实体也算                        find_strong_zones() 用 [low, high]，不只看收盘价
 # 最高价到昨天这一整段下跌阶段都算            find_strong_zones() 窗口 = [find_peak_idx(), 昨天]
-# 压力区很近 → 目标取最近的那个              pick_target()：上方最近压力区的下沿
+# 压力区很近 → 目标取最近的那个              pick_target()：上方最近压力区的下沿；已在区内则不买
 # 成交量 > 买入当天那根K线的成交量           find_strong_zones(v0=买入当天量)
 # 买入后遇当日量 > 2×MA10 → 卖 1/3 持仓      _do_sell()：vol_exceed() + reduce_shares()
 #

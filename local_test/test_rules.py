@@ -26,6 +26,8 @@
  17  持仓放量减仓：当日量 > 2×MA10 才减、1/3 取整到 100 股、不足 2 手不减
  18  急跌三条口径：首尾相接不算 / 跳空才算 / 第一根不足1%且没破前低不算 /
       破了前低就算 / 跌停板豁免缺口
+ 19  站上 L 那根上涨K线的涨幅必须 > 1%（原文"上涨的k线也要>1%"）
+ 20  标的池剔除 ST / *ST（is_st 接口优先，退化按简称，接口挂了不乱杀）
 """
 
 import os
@@ -170,8 +172,12 @@ def run():
           S.pick_target([(20.0, 21.0), (26.0, 27.0), (30.0, 31.0)], 25.0) == 26.0)
     check('14e 上方无压力区 → None',
           S.pick_target([(20.0, 21.0), (24.0, 24.5)], 25.0) is None)
-    check('14f 买入价已在压力区内 → 取上沿',
-          S.pick_target([(25.0, 25.1), (28.0, 28.5)], 25.05) == 25.1)
+    check('14f 买入价已在压力区内 → 不给目标（压力太近，不买）',
+          S.pick_target([(25.0, 25.1), (28.0, 28.5)], 25.05) is None)
+    check('14g 买入价正好压着下沿 → 不给目标',
+          S.pick_target([(25.0, 25.5)], 25.0) is None)
+    check('14h 买入价在区内但上方另有压力区 → 仍然不买',
+          S.pick_target([(25.0, 25.5), (30.0, 31.0)], 25.2) is None)
 
     print('\n[15] 强压力区（价格区间重合，含影线）')
     V0 = 1200.0          # 买入当天量：放量K线 2000 > 1200，但 2000 < 2×1200=2400（避免触发2倍量）
@@ -315,6 +321,46 @@ def run():
         check('18g 跌停板豁免缺口 → 算急跌', S.is_sharp_decline(o, c, 7) is True)
     finally:
         S.REQUIRE_GAP, S.REQUIRE_FIRST_DROP = g0, f0
+
+    print('\n[19] 站上 L 的那根上涨K线涨幅必须 > 1%')
+    g1 = S.REQUIRE_STAND_GAIN
+    try:
+        S.REQUIRE_STAND_GAIN = True
+        check('19a 涨幅 1.5% → 通过', S.stand_gain_ok(25.375, 25.0) is True)
+        check('19b 涨幅正好 1% → 不通过（严格大于）',
+              S.stand_gain_ok(25.25, 25.0) is False)
+        check('19c 涨幅 0.28% → 不通过', S.stand_gain_ok(25.07, 25.0) is False)
+        check('19d 下跌 -1.5% → 不通过', S.stand_gain_ok(24.625, 25.0) is False)
+        check('19e 昨收缺失/为0 → 不通过',
+              S.stand_gain_ok(25.5, None) is False and S.stand_gain_ok(25.5, 0.0) is False)
+        S.REQUIRE_STAND_GAIN = False
+        check('19f 关掉开关 → 只要价 > L 就通过', S.stand_gain_ok(24.95, 25.0) is True)
+    finally:
+        S.REQUIRE_STAND_GAIN = g1
+
+    print('\n[20] ST / *ST 剔除')
+    check('20a 名称带 ST → 是', S.is_st_name('ST康得') is True)
+    check('20b 星号 ST → 是', S.is_st_name('*ST海润') is True)
+    check('20c S*ST 也算', S.is_st_name('S*ST前锋') is True)
+    check('20d 普通简称 → 不是', S.is_st_name('平安银行') is False)
+    check('20e 空名称 → 不是', S.is_st_name(None) is False)
+    check('20f is_st 标记为 True 的剔除',
+          S.strip_st(['A.SH', 'B.SZ'], st_flags={'B.SZ': True}) == ['A.SH'])
+    check('20g is_st 明确为 False 的保留（哪怕名字怪）',
+          S.strip_st(['A.SH', 'B.SZ'], st_flags={'A.SH': False, 'B.SZ': False}) == ['A.SH', 'B.SZ'])
+    check('20h 没有 is_st 时按名称剔除',
+          S.strip_st(['A.SH', 'B.SZ'], names={'A.SH': '浦发银行', 'B.SZ': '*ST康得'}) == ['A.SH'])
+    check('20i is_st=False 优先于名称（接口说不是 ST 就保留）',
+          S.strip_st(['B.SZ'], names={'B.SZ': '*ST康得'}, st_flags={'B.SZ': False}) == ['B.SZ'])
+    check('20j 两个信息都没有 → 原样保留（不乱删）',
+          S.strip_st(['A.SH', 'B.SZ']) == ['A.SH', 'B.SZ'])
+    e0 = S.EXCLUDE_ST
+    try:
+        S.EXCLUDE_ST = False
+        check('20k 关掉开关 → 不剔除',
+              S.strip_st(['B.SZ'], st_flags={'B.SZ': True}) == ['B.SZ'])
+    finally:
+        S.EXCLUDE_ST = e0
 
     print('\n' + '=' * 60)
     total = PASSED[0] + len(FAILED)
