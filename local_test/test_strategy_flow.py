@@ -401,6 +401,43 @@ def main():
           pf.positions.get(CODE) is not None
           and pf.positions[CODE].total_amount == 300, str(pf.positions))
 
+    print('\n[场景 R] 标的池 = 主板：创业板 / 科创板进不来，主板票保留')
+    ctx, pf = run_scenario('R', now_price=25.20, now_vol=1200.0)
+    orig_sec = S.get_all_securities
+
+    def _sec_with_gem(types=None, date=None):
+        df = orig_sec(types=types, date=date)
+        extra = pd.DataFrame({'display_name': ['宁德时代', '科创测试'],
+                              'start_date': [datetime.date(2018, 6, 11)] * 2,
+                              'end_date': [datetime.date(2030, 1, 1)] * 2},
+                             index=['300750.XSHE', '688981.XSHG'])
+        return pd.concat([df, extra])
+
+    S.get_all_securities = _sec_with_gem
+    try:
+        pool = S._get_universe(ctx)
+    finally:
+        S.get_all_securities = orig_sec
+    check('R1 300750(创业板) / 688981(科创板) 被剔除，主板票还在',
+          CODE in pool and '300750.XSHE' not in pool and '688981.XSHG' not in pool,
+          str(pool))
+
+    print('\n[场景 S] 次新股（上市不满 3 年）不进池子')
+    ctx, pf = run_scenario('S', now_price=25.20, now_vol=1200.0)
+    orig_sec = S.get_all_securities
+
+    def _sec_young(types=None, date=None):
+        df = orig_sec(types=types, date=date).copy()
+        df['start_date'] = [pd.Timestamp(date) - pd.Timedelta(days=730)]   # 上市 2 年
+        return df
+
+    S.get_all_securities = _sec_young
+    try:
+        pool = S._get_universe(ctx)
+    finally:
+        S.get_all_securities = orig_sec
+    check('S1 上市 2 年 → 被剔除，池子为空', pool == [], str(pool))
+
     print('\n' + '=' * 60)
     total = PASSED[0] + len(FAILED)
     if FAILED:

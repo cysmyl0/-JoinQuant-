@@ -35,7 +35,9 @@
        - 窗口内任意一根成交量 ≥ 2 × V0 → 这一根本身整段也算强压力区
        - 目标 = 买入价上方最近的那条压力区的【下沿】（价格第一次碰到压力区的价位）
 8.  否决项：成交量 ≥ 2 倍 10 日均量的 K 线（买入当天）不买
-9.  标的池：默认【中证500】成分股，剔除 ST / *ST、剔除停牌；不做市值/价格过滤
+9.  标的池：默认【沪深主板】（沪 600/601/603/605 + 深 000/001/002/003）
+        - 剔除 ST / *ST、剔除停牌、上市满 500 自然日；不做市值/价格过滤
+        - 不含创业板(300/301)、科创板(688/689)、北交所、B股
 10. 所有买入和卖出都在每天 14:55 执行（1 分钟级回测 + run_daily 定时任务）
 11. 持仓期间：某天成交量 > 2 × MA10(VOL)（与第 4 条同一条线的另一侧）→ 当天卖出 1/3 持仓
        - 先看止盈/止损，两者都没触发才减仓；同一天不会既减仓又清仓
@@ -96,10 +98,13 @@ LOOKBACK_L   = 10       # 只在最近 10 根里找有效大阴线 L（否则 L 
 HIGH_BACK    = 250      # 往前找"上一个最高价"的回溯根数（压力区窗口 = 最高价那根 → 昨天）
 
 # ---------- 选股 / 仓位 / 费率 ----------
-UNIVERSE     = 'zz500'    # 'all' 全市场(约5000只) | 'hs300' | 'zz500'（默认） | 'zz1000'
+UNIVERSE     = 'main_board'  # 'main_board' 沪深主板（默认）| 'all' 全市场 | 'hs300' | 'zz500' | 'zz1000'
 IDX_MAP      = {'hs300': '000300.XSHG', 'zz500': '000905.XSHG', 'zz1000': '000852.XSHG'}
+MAIN_BOARD_PREFIXES = ('600', '601', '603', '605',   # 沪市主板
+                       '000', '001', '002', '003')   # 深市主板（含 2021 年并入的原中小板 002/003）
 EXCLUDE_ST   = True     # True: 剔除 ST / *ST（用 get_extras('is_st') 判，取不到再看股票名称）
-MIN_LIST_DAYS = 500     # 上市满 500 个自然日（约 340 个交易日）才纳入
+MIN_LIST_YEARS = 3      # 上市满 3 年才纳入
+MIN_LIST_DAYS = 365 * MIN_LIST_YEARS   # = 1095 个自然日（按自然日算，不是交易日）
 BARS_SCAN    = 60       # 第一步扫描用日线根数（够算 detect_setup + 均量）
 BARS_FULL    = 300      # 第二轮算强压力区用日线根数（需覆盖 HIGH_BACK）
 MAX_CAND     = 500      # 单日候选上限（控制 14:55 的耗时）
@@ -741,6 +746,45 @@ def trade_1455(context):
     _do_buy(context, today, picks)
 
 
+def listed_long_enough(start_date, ref_date, days=None):
+    """
+    上市满 N 个自然日才算老股（默认 3 年 = 1095 天）。
+    次新股/新股不参与：一方面历史K线太短，压力区和 20 日线算不准；
+    另一方面上市初期的爆炒下跌跟"强势结构"不是一回事。
+    """
+    if days is None:
+        days = MIN_LIST_DAYS
+    if start_date is None or ref_date is None:
+        return False
+    try:
+        s = pd.Timestamp(start_date)
+        r = pd.Timestamp(ref_date)
+        if pd.isna(s) or pd.isna(r):
+            return False
+        return (r - s).days >= int(days)
+    except Exception:
+        return False
+
+
+def is_main_board(code):
+    """
+    是否沪深主板股票（按 6 位代码前缀判，带不带 .XSHG/.XSHE 都行）：
+      沪市主板  600 / 601 / 603 / 605
+      深市主板  000 / 001 / 002 / 003（2021 年中小板并入深市主板，所以 002/003 也算）
+    排除：
+      创业板    300 / 301
+      科创板    688 / 689
+      北交所    43x / 83x / 87x / 92x（8 开头、4 开头）
+      B 股      900（沪）、200（深）
+    """
+    if code is None:
+        return False
+    s = str(code).split('.')[0].strip()
+    if len(s) != 6 or not s.isdigit():
+        return False
+    return s[:3] in MAIN_BOARD_PREFIXES
+
+
 def is_st_name(name):
     """
     股票简称里带 ST 就算 ST（含 *ST、ST、S*ST 等写法）。
@@ -775,7 +819,7 @@ def strip_st(codes, names=None, st_flags=None):
 
 
 def _get_universe(context):
-    """标的池：指数成分股（默认中证500）→ 剔除 ST/*ST → 剔除停牌。不做市值/价格过滤。"""
+    """标的池：沪深主板（默认）→ 剔除 ST/*ST → 剔除停牌。不做市值/价格过滤。"""
     d = context.previous_date
     codes = []
     names = {}
@@ -794,9 +838,17 @@ def _get_universe(context):
         else:
             if sec is None or len(sec) == 0:
                 return []
-            cutoff = pd.Timestamp(d) - pd.Timedelta(days=MIN_LIST_DAYS)
-            sec = sec[sec['start_date'].apply(lambda x: pd.Timestamp(x) <= cutoff)]
-            codes = list(sec.index)
+            n_all = len(sec)
+            sec = sec[[listed_long_enough(sec.at[c, 'start_date'], d) for c in sec.index]]
+            if VERBOSE:
+                log.info('剔除上市不满 %d 年：%d → %d 只' % (MIN_LIST_YEARS, n_all, len(sec)))
+            if UNIVERSE == 'main_board':
+                # 主板 = 沪 60x + 深 000/001/002/003，剔除创业板/科创板/北交所/B股
+                codes = [c for c in sec.index if is_main_board(c)]
+            else:
+                codes = list(sec.index)
+        if VERBOSE:
+            log.info('标的池 %s：%d 只（%s）' % (UNIVERSE, len(codes), d))
     except Exception as e:
         log.error('取标的池失败: %s' % e)
         return []

@@ -28,6 +28,10 @@
       破了前低就算 / 跌停板豁免缺口
  19  站上 L 那根上涨K线的涨幅必须 > 1%（原文"上涨的k线也要>1%"）
  20  标的池剔除 ST / *ST（is_st 接口优先，退化按简称，接口挂了不乱杀）
+ 21  止盈：到压力区卖 2/3、留 1/3 跟 20 日线、不够拆全卖
+ 22  20 日均线跌破容差 1%
+ 23  主板识别（60x + 000/001/002/003，排除创业板/科创板/北交所/B股）
+ 24  排除上市未满 3 年（次新股）
 """
 
 import os
@@ -417,6 +421,47 @@ def run():
               S.sell_decision(26.60, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == '')
     finally:
         S.MA20_TOL = t0
+
+    print('\n[23] 主板识别（沪 600/601/603/605 + 深 000/001/002/003，排除创业板/科创板/北交所/B股）')
+    check('23a 600000.XSHG（沪主板）→ 是', S.is_main_board('600000.XSHG') is True)
+    check('23b 601318.XSHG（沪主板）→ 是', S.is_main_board('601318.XSHG') is True)
+    check('23c 603288.XSHG（沪主板）→ 是', S.is_main_board('603288.XSHG') is True)
+    check('23d 605499.XSHG（沪主板）→ 是', S.is_main_board('605499.XSHG') is True)
+    check('23e 000001.XSHE（深主板）→ 是', S.is_main_board('000001.XSHE') is True)
+    check('23f 001979.XSHE（深主板）→ 是', S.is_main_board('001979.XSHE') is True)
+    check('23g 002415.XSHE（原中小板，现属深主板）→ 是', S.is_main_board('002415.XSHE') is True)
+    check('23h 003816.XSHE（深主板）→ 是', S.is_main_board('003816.XSHE') is True)
+    check('23i 300750.XSHE（创业板）→ 否', S.is_main_board('300750.XSHE') is False)
+    check('23j 301029.XSHE（创业板）→ 否', S.is_main_board('301029.XSHE') is False)
+    check('23k 688981.XSHG（科创板）→ 否', S.is_main_board('688981.XSHG') is False)
+    check('23l 689009.XSHG（科创板）→ 否', S.is_main_board('689009.XSHG') is False)
+    check('23m 830799.XSHE（北交所）→ 否', S.is_main_board('830799.XSHE') is False)
+    check('23n 900901.XSHG（沪B股）→ 否', S.is_main_board('900901.XSHG') is False)
+    check('23o 不带后缀的 002415 → 是', S.is_main_board('002415') is True)
+    check('23p None / 空串 / 乱码 → 否',
+          S.is_main_board(None) is False and S.is_main_board('') is False
+          and S.is_main_board('ABCDEF') is False)
+
+    print('\n[24] 排除上市未满 3 年（1095 个自然日）')
+    ref = datetime.date(2024, 6, 1)
+    check('24a 恰好满 1095 天 → 纳入',
+          S.listed_long_enough(ref - datetime.timedelta(days=1095), ref) is True)
+    check('24b 1094 天（差一天）→ 剔除',
+          S.listed_long_enough(ref - datetime.timedelta(days=1094), ref) is False)
+    check('24c 上市 2 年 → 剔除',
+          S.listed_long_enough(ref - datetime.timedelta(days=730), ref) is False)
+    check('24d 上市 8 年 → 纳入',
+          S.listed_long_enough(ref - datetime.timedelta(days=2920), ref) is True)
+    check('24e 上市日期缺失 → 剔除（拿不准就不买）',
+          S.listed_long_enough(None, ref) is False)
+    check('24f 参考日期缺失 → 剔除',
+          S.listed_long_enough(ref - datetime.timedelta(days=2000), None) is False)
+    check('24g 乱码日期 → 剔除',
+          S.listed_long_enough('not-a-date', ref) is False)
+    check('24h 天数阈值可改：days=180 → 半年前的票也算老股',
+          S.listed_long_enough(ref - datetime.timedelta(days=200), ref, days=180) is True)
+    check('24i 时间倒挂（上市日期在未来）→ 剔除',
+          S.listed_long_enough(ref + datetime.timedelta(days=10), ref) is False)
 
     print('\n' + '=' * 60)
     total = PASSED[0] + len(FAILED)
