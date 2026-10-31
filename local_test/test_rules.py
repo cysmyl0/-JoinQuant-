@@ -157,10 +157,12 @@ def run():
     check('11b 只有2根下跌 → False', S.is_sharp_decline(o, c, 11) is False)
 
     print('\n[12-14] 量能 / 不创新低 / 盈亏比')
-    check('12a 等于5日均量 → 不买', S.volume_ok(1000, 1000, 1000) is False)
+    check('12a 等于5日均量 → 有10%容差，算过', S.volume_ok(1000, 1000, 1000) is True)
     check('12b 放量适中 → 买', S.volume_ok(1500, 1000, 1000) is True)
     check('12c 达到2倍10日均量 → 不买', S.volume_ok(2000, 1000, 1000) is False)
-    check('12d 不到5日均量 → 不买', S.volume_ok(900, 1000, 1000) is False)
+    check('12d 只有5日均量的90% → 不买（严格大于）', S.volume_ok(900, 1000, 1000) is False)
+    check('12e 均量的95% → 落在容差内，算过', S.volume_ok(950, 1000, 1000) is True)
+    check('12f 均量的89% → 容差外，不买', S.volume_ok(890, 1000, 1000) is False)
 
     check('13a 收盘价≥前低', S.no_new_low(23.00, 22.50) is True)
     check('13b 收盘价<前低', S.no_new_low(22.40, 22.50) is False)
@@ -361,6 +363,60 @@ def run():
               S.strip_st(['B.SZ'], st_flags={'B.SZ': True}) == ['B.SZ'])
     finally:
         S.EXCLUDE_ST = e0
+
+    print('\n[21] 止盈：到压力区卖 2/3，剩下 1/3 跟 20 日线')
+    check('21a 1000股 → 卖600', S.tp_sell_shares(1000) == 600)
+    check('21b 500股 → 卖300（取整手）', S.tp_sell_shares(500) == 300)
+    check('21c 300股 → 卖200', S.tp_sell_shares(300) == 200)
+    check('21d 200股 → 卖100（剩1手）', S.tp_sell_shares(200) == 100)
+    check('21e 100股 → 不够拆，全卖', S.tp_sell_shares(100) == 100)
+    check('21f 0股 → 0', S.tp_sell_shares(0) == 0)
+
+    ent = {'p_low': 24.0, 'target': 27.95, 'buy': 25.0}
+    d0 = datetime.date(2024, 6, 3)
+    bd = datetime.date(2024, 5, 30)
+    check('21g 到压力区且站上20日线 → 只卖 2/3',
+          S.sell_decision(27.95, dict(ent), d0, bd, ma20=26.98)[0] == 'part')
+    check('21h 到压力区但价 == 20日线 → 还在容差内 → 仍卖 2/3',
+          S.sell_decision(27.95, dict(ent), d0, bd, ma20=27.95)[0] == 'part')
+    check('21i 到压力区但价格在20日线下方 → 全卖',
+          S.sell_decision(27.95, dict(ent), d0, bd, ma20=28.50)[0] == 'all')
+    check('21j 到压力区但拿不到20日线 → 全卖',
+          S.sell_decision(27.95, dict(ent), d0, bd, ma20=None)[0] == 'all')
+    check('21k 卖过2/3后 跌破20日线 → 清掉剩下的1/3',
+          S.sell_decision(26.00, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == 'all')
+    check('21l 卖过2/3后 仍在20日线上方 → 继续持有',
+          S.sell_decision(27.50, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == '')
+    check('21m 卖过2/3后 跌破前低 → 照样止损',
+          S.sell_decision(23.90, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == 'all')
+    check('21n T+1 当天不能卖',
+          S.sell_decision(27.95, dict(ent), d0, d0, ma20=26.98)[0] == '')
+    f0 = S.TP_FOLLOW_MA
+    try:
+        S.TP_FOLLOW_MA = False
+        check('21o 关掉开关 → 到压力区仍全清（旧行为）',
+              S.sell_decision(27.95, dict(ent), d0, bd, ma20=26.98)[0] == 'all')
+    finally:
+        S.TP_FOLLOW_MA = f0
+
+    print('\n[22] 20 日均线跌破容差 1%（价 < MA20×0.99 才算跌破）')
+    check('22a 容差线 = MA20×0.99', abs(S.ma_band(26.98) - 26.7102) < 1e-6,
+          str(S.ma_band(26.98)))
+    check('22b 尾巴价 26.80（在容差内）→ 继续持有',
+          S.sell_decision(26.80, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == '')
+    check('22c 尾巴价 26.70（跌破容差线 26.71）→ 清仓',
+          S.sell_decision(26.70, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == 'all')
+    check('22d 到压力区时价 27.95 在均线 28.00 下方但只差 0.18% → 仍卖 2/3',
+          S.sell_decision(27.95, dict(ent), d0, bd, ma20=28.00)[0] == 'part')
+    check('22e 到压力区时价 27.95 比均线 28.50 低 1.9% → 全卖',
+          S.sell_decision(27.95, dict(ent), d0, bd, ma20=28.50)[0] == 'all')
+    t0 = S.MA20_TOL
+    try:
+        S.MA20_TOL = 0.02
+        check('22f 容差改成 2% → 26.60 不再算跌破（26.44 以下才算）',
+              S.sell_decision(26.60, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == '')
+    finally:
+        S.MA20_TOL = t0
 
     print('\n' + '=' * 60)
     total = PASSED[0] + len(FAILED)

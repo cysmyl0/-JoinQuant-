@@ -148,7 +148,14 @@ def make_env(now_price, now_vol, today, yesterday):
     def attribute_history(security, count, unit='1d', fields=None,
                           skip_paused=True, df=False, fq='pre'):
         k = min(int(count), N)
-        return {f: np.array(V[-k:], dtype=float) for f in (fields or ['volume'])}
+        fields = list(fields or ['volume'])
+        out = {}
+        for f in fields:
+            if f == 'close':
+                out[f] = np.array(C[-k:], dtype=float)      # 截至昨天的收盘
+            else:
+                out[f] = np.array(V[-k:], dtype=float)
+        return out
 
     def get_all_securities(types=None, date=None):
         return pd.DataFrame({'display_name': [CURRENT.get('name', '测试股')],
@@ -242,19 +249,38 @@ def run_scenario(name, now_price, now_vol, cash=1000000.0,
     return ctx, pf
 
 
-def run_hold(now_price, now_vol, shares=1000):
+def run_hold(now_price, now_vol, shares=1000, target=30.0, p_low=22.50, tp2=False):
     """已持仓场景：先跑一遍初始流程（把 g 初始化好），再注入昨天的持仓，重跑一次。"""
     ctx, pf = run_scenario('hold', now_price, now_vol)
     pf.positions.clear()
     pf.positions[CODE] = Obj(total_amount=shares, avg_cost=25.0, last=now_price)
-    S.g.entry[CODE] = {'L': 24.90, 'p_low': 22.50, 'target': 30.0, 'buy': 25.0,
+    S.g.entry[CODE] = {'L': 24.90, 'p_low': p_low, 'target': target, 'buy': 25.0,
                        'rr': 2.0, 'L_idx': 56,
                        'buy_date': datetime.date(2024, 5, 30)}
+    if tp2:
+        S.g.entry[CODE]['tp2_done'] = True
     S.g.buy_date[CODE] = datetime.date(2024, 5, 30)
     S.g.stat['reduce'] = 0
+    S.g.stat['tp_part'] = 0
     del ORDERS[:]
     S.trade_1455(ctx)
     return ctx, pf
+
+
+def rerun(ctx, now_price, now_vol):
+    """换一天、换一个 14:55 的价/量，在同一个组合上再跑一次（模拟持仓过夜到次日）。"""
+    today = datetime.date(2024, 6, 4)
+    yesterday = datetime.date(2024, 6, 3)
+    old_g = S.g
+    make_env(now_price, now_vol, today, yesterday)
+    S.g = old_g          # make_env 会重置 g，这里把持仓记录/统计接回来
+    pf = ctx.portfolio
+    pf.refresh()
+    ctx2 = Obj(current_dt=datetime.datetime(2024, 6, 4, 14, 55),
+               previous_date=yesterday, portfolio=pf)
+    del ORDERS[:]
+    S.trade_1455(ctx2)
+    return pf
 
 
 def main():
@@ -327,6 +353,53 @@ def main():
     print('\n[场景 J] is_st 失效但简称正常 → 正常买入（不因为接口挂了就全禁）')
     ctx, pf = run_scenario('J', now_price=25.20, now_vol=1500.0, st_fail=True)
     check('J1 接口失效仍能买', len([x for x in ORDERS if x[0] == 'buy']) == 1, str(ORDERS))
+
+    print('\n[场景 K] 到压力区(27.95) 且站上20日线(≈26.98) → 卖 2/3（1000股 → 卖600，留400）')
+    ctx, pf = run_hold(now_price=27.95, now_vol=1500.0, shares=1000, target=27.95)
+    sells = [x for x in ORDERS if x[0] == 'sell']
+    check('K1 只下 1 笔卖出', len(sells) == 1, str(ORDERS))
+    check('K2 卖掉 600 股、留 400 股',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 400, str(pf.positions))
+    e = S.g.entry.get(CODE)
+    check('K3 记下已止盈 2/3', e is not None and e.get('tp2_done') is True, str(e))
+    check('K4 计数 tp_part=1', S.g.stat.get('tp_part') == 1, str(S.g.stat))
+
+    print('\n[场景 L] 剩下 1/3 跌破 20 日线(26.00 < 26.98) → 清掉')
+    pf2 = rerun(ctx, 26.00, 1500.0)
+    check('L1 清空剩余持仓', CODE not in pf2.positions, str(pf2.positions))
+    check('L2 卖出记录被移除', CODE not in S.g.entry, str(list(S.g.entry)))
+
+    print('\n[场景 M] 到压力区(26.50) 但价格没过20日线(26.60 < 26.98) → 全卖，不留1/3')
+    ctx, pf = run_hold(now_price=26.60, now_vol=1500.0, shares=1000, target=26.50)
+    check('M1 全部卖出', CODE not in pf.positions, str(pf.positions))
+    check('M2 卖出记录被移除', CODE not in S.g.entry, str(list(S.g.entry)))
+
+    print('\n[场景 N] 卖过 2/3 后价格仍在 20 日线上方(27.50 > 26.98) → 继续持有，不再卖')
+    ctx, pf = run_hold(now_price=27.50, now_vol=1500.0, shares=400,
+                       target=26.50, tp2=True)
+    check('N1 不再卖出', len([x for x in ORDERS if x[0] == 'sell']) == 0, str(ORDERS))
+    check('N2 400 股原样持有',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 400, str(pf.positions))
+
+    print('\n[场景 O] 当日量 = 5日均量的 95%（10%容差内）→ 应买入')
+    ctx, pf = run_scenario('O', now_price=25.20, now_vol=950.0)
+    check('O1 容差内算放量过均线，买入 1 笔',
+          len([x for x in ORDERS if x[0] == 'buy']) == 1, str(ORDERS))
+
+    print('\n[场景 P] 当日量 = 5日均量的 89%（容差外）→ 不买')
+    ctx, pf = run_scenario('P', now_price=25.20, now_vol=890.0)
+    check('P1 量能不够，不买',
+          len([x for x in ORDERS if x[0] == 'buy']) == 0, str(ORDERS))
+
+    print('\n[场景 Q] 已卖过2/3（剩400股）+ 当日量2.5倍 → 尾巴阶段照样放量减仓（卖100剩300）')
+    ctx, pf = run_hold(now_price=27.50, now_vol=2500.0, shares=400,
+                       target=26.50, tp2=True)
+    check('Q1 触发减仓 1 笔', S.g.stat.get('reduce') == 1, str(S.g.stat))
+    check('Q2 尾巴剩 300 股',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 300, str(pf.positions))
 
     print('\n' + '=' * 60)
     total = PASSED[0] + len(FAILED)
