@@ -185,50 +185,94 @@ def run():
     check('14h 买入价在区内但上方另有压力区 → 仍然不买',
           S.pick_target([(25.0, 25.5), (30.0, 31.0)], 25.2) is None)
 
-    print('\n[15] 强压力区（价格区间重合，含影线）')
-    V0 = 1200.0          # 买入当天量：放量K线 2000 > 1200，但 2000 < 2×1200=2400（避免触发2倍量）
+    # 14i 三态判定：压力区在上方 / 买入价已在区内 / 上方一条都没有
+    check('14i 上方有压力区 → above',
+          S.zone_status([(26.0, 27.0)], 25.0) == 'above')
+    check('14i 买入价已在区内 → inside',
+          S.zone_status([(25.0, 25.5)], 25.2) == 'inside')
+    check('14i 压力区全在买入价下方 → none',
+          S.zone_status([(18.0, 19.0), (20.0, 21.0)], 25.0) == 'none')
+    check('14i 一条压力区都没算出来 → none', S.zone_status([], 25.0) == 'none')
 
-    # 15a 三根放量K线的 [最低价,最高价] 交集 = [25.0, 25.1]
+    # 14j 上方没压力区时的兜底：按固定 2:1 算目标，但必须落在 250 日最高价之内
+    check('14j 250日高点有空间 → 目标 = 买入 + 2×(买入-前低) = 30.0',
+          abs(S.fallback_target(25.0, 22.5, 40.0) - 30.0) < 1e-9)
+    check('14j 250日最高价正好等于目标 → 边界通过',
+          abs(S.fallback_target(25.0, 22.5, 30.0) - 30.0) < 1e-9)
+    check('14j 250日最高价不够 2:1（29.0 < 30.0）→ 不买',
+          S.fallback_target(25.0, 22.5, 29.0) is None)
+    check('14j 买入价已在 250 日最高价上 → 没有空间，不买',
+          S.fallback_target(25.0, 24.0, 25.0) is None)
+    check('14j 前低 ≥ 买入价（没有风险度）→ 不买',
+          S.fallback_target(25.0, 25.0, 40.0) is None)
+    check('14j 没给 250 日最高价 → 不买',
+          S.fallback_target(25.0, 22.5, None) is None)
+
+    # 14k 到价判定：持仓期跳空（开盘价已在目标价之上）怎么处理
+    #   签名：target_hit(price, target, day_open, day_high, day_low, gap_hold)
+    check('14k 高开在目标之上、全天没回落 → 不卖',
+          S.target_hit(28.80, 27.95, 28.60, 29.00, 28.20) is False)
+    check('14k 高开在目标之上、盘中回落到目标价 → 卖（跳空回踩）',
+          S.target_hit(28.50, 27.95, 28.60, 29.00, 27.80) is True)
+    check('14k 高开在目标之上、盘中最低正好等于目标价 → 卖',
+          S.target_hit(28.50, 27.95, 28.60, 29.00, 27.95) is True)
+    check('14k 开盘低于目标、盘中最高摸到 → 卖',
+          S.target_hit(27.20, 27.95, 27.00, 28.10, 26.90) is True)
+    check('14k 开盘低于目标、盘中也没摸到 → 不卖',
+          S.target_hit(27.20, 27.95, 27.00, 27.50, 26.90) is False)
+    check('14k 没有当日高低价 → 退回用 14:55 价判',
+          S.target_hit(27.95, 27.95, None, None, None) is True
+          and S.target_hit(27.90, 27.95, None, None, None) is False)
+    check('14k 关掉 GAP_UP_HOLD（旧口径）→ 高开在目标之上就直接卖',
+          S.target_hit(28.80, 27.95, 28.60, 29.00, 28.20, gap_hold=False) is True)
+    check('14k 没给目标价 → 不卖', S.target_hit(28.80, None) is False)
+
+    print('\n[15] 强压力区（只算没被上涨收复的下降段）')
+    V0 = 1200.0          # 买入当天量：放量K线 2000 > 1200，但 2000 < 2×1200=2400（不触发2倍量）
+    NO_PH = 0            # 关掉"前高3根"，单独测重合逻辑
+
+    # 15a 三根放量、高点逐根递减（没被收复）→ 交集 24.90~25.10
     rows = pad(10, price=27.0, vol=1000.0)
     rows[0] = (30.0, 30.0, 30.5, 29.5, 1000.0)          # 上一个最高价在这根
     rows += [
-        (24.90, 25.10, 25.20, 24.80, 2000.0),
-        (25.00, 25.05, 25.10, 24.90, 2000.0),
-        (25.05, 25.20, 25.30, 25.00, 2000.0),
-        (25.20, 25.20, 25.40, 25.10, 1000.0),           # 不放量，不参与
+        (24.90, 25.10, 25.30, 24.80, 2000.0),
+        (25.00, 25.05, 25.20, 24.90, 2000.0),
+        (25.05, 25.20, 25.10, 24.80, 2000.0),
+        (24.95, 24.95, 25.00, 24.85, 1000.0),           # 不放量，不参与
     ]
     o, c, h, l, v = mk(rows)
     check('15a 峰值定位正确', S.find_peak_idx(h) == 0, 'peak=%d' % S.find_peak_idx(h))
-    zones = S.find_strong_zones(h, l, v, v0=V0)
-    check('15a 三根放量区间重合 → 25.00~25.10',
-          len(zones) == 1 and abs(zones[0][0] - 25.0) < 1e-9
-          and abs(zones[0][1] - 25.1) < 1e-9, 'zones=%s' % zones)
+    zones = S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH)
+    check('15a 三根放量区间重合 → 24.90~25.10',
+          len(zones) == 1 and abs(zones[0][0] - 24.90) < 1e-9
+          and abs(zones[0][1] - 25.10) < 1e-9, 'zones=%s' % zones)
 
-    # 15b 实体完全不重合，但上/下影线重合 → 仍然算强压力区（关键：不只看收盘价）
+    # 15b 实体完全不重合，但上/下影线重合 → 仍然算强压力区（不只看收盘价）
     rows = pad(6, price=27.0, vol=1000.0)
     rows[0] = (30.0, 30.0, 30.5, 29.5, 1000.0)
     rows += [
-        (24.00, 24.50, 25.00, 23.80, 2000.0),           # 实体24.0~24.5，上影到25.0
-        (25.20, 25.50, 25.60, 24.90, 2000.0),           # 实体25.2~25.5，下影到24.9
-        (24.80, 25.00, 25.10, 24.40, 2000.0),
+        (24.00, 24.40, 25.60, 23.80, 2000.0),           # 实体24.00~24.40，上影到25.60
+        (24.90, 25.20, 25.25, 24.85, 2000.0),           # 实体24.90~25.20
+        (24.40, 24.70, 25.15, 24.30, 2000.0),           # 实体24.40~24.70
     ]
     o, c, h, l, v = mk(rows)
-    zones = S.find_strong_zones(h, l, v, v0=V0)
+    zones = S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH)
     check('15b 影线重合、实体不重合 → 仍算压力区',
-          len(zones) == 1 and abs(zones[0][0] - 24.9) < 1e-9
-          and abs(zones[0][1] - 25.0) < 1e-9, 'zones=%s' % zones)
+          len(zones) == 1 and abs(zones[0][0] - 24.85) < 1e-9
+          and abs(zones[0][1] - 25.15) < 1e-9, 'zones=%s' % zones)
 
     # 15c 只有两根放量K线重合 → 不够三根，不算
     rows = pad(6, price=27.0, vol=1000.0)
     rows[0] = (30.0, 30.0, 30.5, 29.5, 1000.0)
     rows += [
-        (24.00, 24.50, 25.00, 23.80, 2000.0),
-        (25.20, 25.50, 25.60, 24.90, 2000.0),
-        (24.80, 25.00, 25.10, 24.40, 1000.0),           # 第三根不放量
+        (24.00, 24.40, 25.60, 23.80, 2000.0),
+        (24.90, 25.20, 25.25, 24.85, 2000.0),
+        (24.40, 24.70, 25.15, 24.30, 1000.0),           # 第三根不放量
     ]
     o, c, h, l, v = mk(rows)
-    check('15c 只有2根放量 → 不算', S.find_strong_zones(h, l, v, v0=V0) == [],
-          'zones=%s' % S.find_strong_zones(h, l, v, v0=V0))
+    check('15c 只有2根放量 → 不算',
+          S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH) == [],
+          'zones=%s' % S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH))
 
     # 15d 窗口起点：最高价之前的三根重合不算（下跌阶段才看）
     rows = [
@@ -240,15 +284,16 @@ def run():
         (28.0, 27.5, 28.2, 27.3, 1000.0),
     ]
     o, c, h, l, v = mk(rows)
-    check('15d 最高价之前的重合不算', S.find_strong_zones(h, l, v, v0=V0) == [],
-          'zones=%s' % S.find_strong_zones(h, l, v, v0=V0))
+    check('15d 最高价之前的重合不算',
+          S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH) == [],
+          'zones=%s' % S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH))
 
     # 15e 单根 2 倍量 → 整根 [最低价, 最高价] 都算压力区
     rows = pad(6, price=27.0, vol=1000.0)
     rows[0] = (30.0, 30.0, 30.5, 29.5, 1000.0)
     rows += [(26.0, 26.1, 26.2, 25.8, 2500.0)]
     o, c, h, l, v = mk(rows)
-    zones = S.find_strong_zones(h, l, v, v0=V0)
+    zones = S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH)
     check('15e 单根2倍量 → 25.80~26.20',
           len(zones) == 1 and abs(zones[0][0] - 25.8) < 1e-9
           and abs(zones[0][1] - 26.2) < 1e-9, 'zones=%s' % zones)
@@ -256,7 +301,79 @@ def run():
     # 15f v0 太大（没有K线放量）→ 无压力区
     o, c, h, l, v = mk(rows)
     check('15f 没有放量K线 → 无压力区',
-          S.find_strong_zones(h, l, v, v0=5000.0) == [])
+          S.find_strong_zones(h, l, v, v0=5000.0, keep_prev_high=NO_PH) == [])
+
+    # 15g 后面又涨回三根K线之上（整根被覆盖）→ 压力释放，不算
+    rows = pad(6, price=27.0, vol=1000.0)
+    rows[0] = (30.0, 30.0, 30.5, 29.5, 1000.0)
+    rows += [
+        (24.90, 25.10, 25.30, 24.80, 2000.0),
+        (25.00, 25.05, 25.20, 24.90, 2000.0),
+        (25.05, 25.20, 25.10, 24.80, 2000.0),
+        (25.40, 25.50, 25.60, 25.30, 1000.0),           # 最高价 25.60 ≥ 上面三根 → 全释放
+    ]
+    o, c, h, l, v = mk(rows)
+    check('15g 被上涨整根覆盖 → 不算压力区',
+          S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH) == [],
+          'zones=%s' % S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH))
+
+    # 15h 最近这一跌（最后一段下降）的放量K线仍算压力
+    rows = pad(4, price=27.0, vol=1000.0)
+    rows[0] = (30.0, 30.0, 30.5, 29.5, 1000.0)
+    for p in [28, 26, 24, 22, 20, 18, 16]:              # 一路跌到 16，不放量
+        rows.append((p, p, p + 0.05, p - 0.05, 1000.0))
+    rows += [
+        (13.00, 12.80, 13.20, 12.60, 2000.0),
+        (12.80, 12.60, 13.00, 12.40, 2000.0),
+        (12.60, 12.40, 12.80, 12.20, 2000.0),
+    ]
+    o, c, h, l, v = mk(rows)
+    zones = S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH)
+    check('15h 最近一跌的放量K线 → 12.60~12.80',
+          len(zones) == 1 and abs(zones[0][0] - 12.60) < 1e-9
+          and abs(zones[0][1] - 12.80) < 1e-9, 'zones=%s' % zones)
+
+    # 15i 前高（最近一次下跌的起点）左边 3 根无条件保留
+    rows = pad(4, price=27.0, vol=1000.0)
+    rows[0] = (30.0, 30.0, 30.5, 29.5, 1000.0)
+    for p in [28, 26, 24, 22, 20, 18, 16, 14, 12, 10]:  # 跌到 10
+        rows.append((p, p, p + 0.05, p - 0.05, 1000.0))
+    for p in [11, 12, 13, 14, 15]:                      # 回升到 15（前高）
+        rows.append((p, p, p + 0.05, p - 0.05, 1000.0))
+    for p in [14.5, 14, 13.5, 13, 12.5, 12]:            # 再跌到 12
+        rows.append((p, p, p + 0.05, p - 0.05, 1000.0))
+    o, c, h, l, v = mk(rows)
+    sw = S.find_recent_swing_high(h)
+    check('15i 前高 = 回升到 15 的那根（不是 30 那根）',
+          abs(h[sw] - 15.05) < 1e-9, 'idx=%d high=%.2f' % (sw, h[sw]))
+    zones = S.find_strong_zones(h, l, v, v0=V0)         # 默认保留前高 3 根
+    check('15i 前高左边 3 根 → 12/13/14 三小段',
+          len(zones) == 3
+          and abs(zones[0][0] - 11.95) < 1e-9
+          and abs(zones[1][0] - 12.95) < 1e-9
+          and abs(zones[2][0] - 13.95) < 1e-9, 'zones=%s' % zones)
+    check('15i 关掉前高 3 根 → 无压力区（全是缩量）',
+          S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH) == [],
+          'zones=%s' % S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH))
+
+    # 15j released_mask 单元测试：后面的最高价 ≥ 本根最高价 → 释放
+    m = S.released_mask([10.0, 11.0, 9.0])
+    check('15j 后面涨到 11 ≥ 本根 10 → 释放', list(m) == [True, False, False], str(m))
+    m = S.released_mask([10.0, 9.0, 8.0])
+    check('15j 高点严格递减 → 都没释放', list(m) == [False, False, False], str(m))
+    m = S.released_mask([10.0, 9.0, 9.0])
+    check('15j 后一根持平前一根 → 前一根释放', list(m) == [False, True, False], str(m))
+    m = S.released_mask([10.0, 10.0])
+    check('15j 后面持平也算覆盖 → 释放', list(m) == [True, False], str(m))
+
+    # 15k find_recent_swing_high：25→10→回升15→再跌到10
+    hh = np.array([25, 20, 15, 13, 11, 10, 11, 13, 15, 13, 11, 10], float)
+    check('15k 前高 = 回升到 15 那根（idx 8）',
+          S.find_recent_swing_high(hh) == 8,
+          'idx=%d' % S.find_recent_swing_high(hh))
+    hh2 = np.array([30, 29, 28, 27, 26], float)
+    check('15k 单边下跌 → 退化为最高价那根（idx 0）',
+          S.find_recent_swing_high(hh2) == 0, 'idx=%d' % S.find_recent_swing_high(hh2))
 
     print('\n[16] 卖出逻辑')
     d0 = datetime.date(2024, 1, 2)

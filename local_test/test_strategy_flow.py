@@ -115,6 +115,9 @@ ORDERS = []
 
 def make_env(now_price, now_vol, today, yesterday):
     """返回挂到 S 模块上的全局函数集合。"""
+    # 每个场景都从"当天没跳过空"开始，避免上一个场景的盘中高低价漏进来
+    for _k in ('day_open', 'day_high', 'day_low'):
+        CURRENT.pop(_k, None)
 
     def get_price(security, end_date=None, count=None, fields=None,
                   skip_paused=True, fq='pre', panel=False):
@@ -134,6 +137,7 @@ def make_env(now_price, now_vol, today, yesterday):
 
     def get_current_data():
         return {CODE: Obj(paused=False, is_st=False, last_price=now_price,
+                          day_open=CURRENT.get('day_open'),
                           high_limit=30.0, low_limit=20.0)}
 
     def history(count, unit='1d', field='avg', security_list=None, df=True,
@@ -141,7 +145,15 @@ def make_env(now_price, now_vol, today, yesterday):
         codes = [security_list] if isinstance(security_list, str) else list(security_list)
         idx = pd.date_range(end=pd.Timestamp(today) + pd.Timedelta(hours=14, minutes=55),
                             periods=int(count), freq='min')
-        per = float(now_vol) / float(count)
+        if field in ('high', 'low'):
+            # 场景没指定当日高低价时返回 NaN → 策略拿不到就退回"14:55 价"老口径
+            val = CURRENT.get('day_high' if field == 'high' else 'day_low')
+            if val is None:
+                data = {s: [np.nan] * int(count) for s in codes}
+                return pd.DataFrame(data, index=idx)
+            per = float(val)
+        else:
+            per = float(now_vol) / float(count)               # 当日总量摊到每分钟
         data = {s: [per] * int(count) for s in codes}
         return pd.DataFrame(data, index=idx)
 
@@ -232,7 +244,7 @@ CURRENT = {}
 
 
 def run_scenario(name, now_price, now_vol, cash=1000000.0,
-                 st=None, st_fail=False, stock_name=None):
+                 st=None, st_fail=False, stock_name=None, patch=None):
     del ORDERS[:]
     CURRENT['st'] = st or {}
     CURRENT['st_fail'] = st_fail
@@ -240,6 +252,8 @@ def run_scenario(name, now_price, now_vol, cash=1000000.0,
     today = datetime.date(2024, 6, 3)
     yesterday = datetime.date(2024, 5, 31)
     make_env(now_price, now_vol, today, yesterday)
+    if patch is not None:
+        patch()          # 在 make_env 之后打补丁（make_env 会把 S.get_price 等重置回默认实现）
     pf = Portfolio(cash)
     CURRENT['portfolio'] = pf
     ctx = Obj(current_dt=datetime.datetime(2024, 6, 3, 14, 55),
@@ -249,9 +263,16 @@ def run_scenario(name, now_price, now_vol, cash=1000000.0,
     return ctx, pf
 
 
-def run_hold(now_price, now_vol, shares=1000, target=30.0, p_low=22.50, tp2=False):
+def run_hold(now_price, now_vol, shares=1000, target=30.0, p_low=22.50, tp2=False,
+             day_open=None, day_high=None, day_low=None):
     """已持仓场景：先跑一遍初始流程（把 g 初始化好），再注入昨天的持仓，重跑一次。"""
     ctx, pf = run_scenario('hold', now_price, now_vol)
+    if day_open is not None:
+        CURRENT['day_open'] = day_open
+    if day_high is not None:
+        CURRENT['day_high'] = day_high
+    if day_low is not None:
+        CURRENT['day_low'] = day_low
     pf.positions.clear()
     pf.positions[CODE] = Obj(total_amount=shares, avg_cost=25.0, last=now_price)
     S.g.entry[CODE] = {'L': 24.90, 'p_low': p_low, 'target': target, 'buy': 25.0,
@@ -437,6 +458,158 @@ def main():
     finally:
         S.get_all_securities = orig_sec
     check('S1 上市 2 年 → 被剔除，池子为空', pool == [], str(pool))
+
+    print('\n[场景 T] 上方找不到压力区 → 用 250 日高点的空间兜底，按固定 2:1 止盈')
+    orig_zones = S.find_strong_zones
+    S.find_strong_zones = lambda *a, **k: []          # 模拟"一条压力区都没算出来"
+    try:
+        ctx, pf = run_scenario('T', now_price=25.20, now_vol=1500.0)
+    finally:
+        S.find_strong_zones = orig_zones
+    buys = [x for x in ORDERS if x[0] == 'buy']
+    e = S.g.entry.get(CODE)
+    check('T1 没有压力区也能买（走兜底）', len(buys) == 1, str(ORDERS))
+    check('T2 目标 = 买入 + 2×(买入-前低) = 25.20+2×1.20 = 27.60',
+          e is not None and abs(e['target'] - 27.60) < 1e-6, str(e))
+    check('T3 盈亏比正好 2:1（浮点容差内）',
+          e is not None and abs(e['rr'] - 2.0) < 1e-6, str(e and e['rr']))
+
+    print('\n[场景 U] 上方没压力区，但 250 日高点也够不到 2:1 的目标 → 不买')
+    orig_zones = S.find_strong_zones
+    orig_get_price = S.get_price
+    cap = 26.50          # 历史上最高价只到 26.50 < 目标 27.60
+
+    def _patch_low_high():
+        base = S.get_price
+
+        def _clip(*a, **k):
+            df = base(*a, **k).copy()
+            for f in ('high', 'low', 'open', 'close'):
+                df[f] = np.minimum(df[f].values, cap)
+            return df
+
+        S.get_price = _clip
+
+    S.find_strong_zones = lambda *a, **k: []
+    try:
+        ctx, pf = run_scenario('U', now_price=25.20, now_vol=1500.0,
+                               patch=_patch_low_high)
+    finally:
+        S.get_price = orig_get_price
+        S.find_strong_zones = orig_zones
+    check('U1 250 日高点 26.50 < 目标 27.60 → 不买',
+          len([x for x in ORDERS if x[0] == 'buy']) == 0, str(ORDERS))
+
+    print('\n[场景 V] 持仓期高开在目标价(27.95)之上，全天没回落 → 不卖，继续持有')
+    ctx, pf = run_hold(now_price=28.80, now_vol=1500.0, shares=1000, target=27.95,
+                       day_open=28.60, day_high=29.00, day_low=28.20)
+    check('V1 不下卖出单', len([x for x in ORDERS if x[0] == 'sell']) == 0, str(ORDERS))
+    check('V2 1000 股原样持有',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 1000, str(pf.positions))
+    check('V3 还没记止盈', not (S.g.entry.get(CODE) or {}).get('tp2_done'),
+          str(S.g.entry.get(CODE)))
+
+    print('\n[场景 W] 持仓期高开到目标价之上，但盘中回落到目标价(最低 27.80) → 卖 2/3')
+    ctx, pf = run_hold(now_price=28.50, now_vol=1500.0, shares=1000, target=27.95,
+                       day_open=28.60, day_high=29.00, day_low=27.80)
+    sells = [x for x in ORDERS if x[0] == 'sell']
+    check('W1 有卖出', len(sells) == 1, str(ORDERS))
+    check('W2 卖 600 留 400',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 400, str(pf.positions))
+    check('W3 记下已止盈 2/3',
+          (S.g.entry.get(CODE) or {}).get('tp2_done') is True, str(S.g.entry.get(CODE)))
+
+    print('\n[场景 X] 开盘低于目标价(27.00)，但盘中最高摸到 28.10 → 正常到价就卖 2/3')
+    ctx, pf = run_hold(now_price=27.20, now_vol=1500.0, shares=1000, target=27.95,
+                       day_open=27.00, day_high=28.10, day_low=26.90)
+    sells = [x for x in ORDERS if x[0] == 'sell']
+    check('X1 有卖出', len(sells) == 1, str(ORDERS))
+    check('X2 卖 600 留 400',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 400, str(pf.positions))
+
+    print('\n[场景 Y] 高开(28.60)>目标(27.95)，10:30 盘中回落到 27.95 → 当场卖 2/3，不等 14:55')
+    ctx, pf = run_hold(now_price=28.80, now_vol=1500.0, shares=1000, target=27.95,
+                       day_open=28.60, day_high=29.00, day_low=28.20)
+    check('Y1 14:55 那一次没卖（全天没回落）',
+          len([x for x in ORDERS if x[0] == 'sell']) == 0, str(ORDERS))
+    ctx.current_dt = datetime.datetime(2024, 6, 3, 10, 30)
+    S.handle_data(ctx, {CODE: Obj(close=27.95)})
+    sells = [x for x in ORDERS if x[0] == 'sell']
+    check('Y2 盘中回落到目标价 → 当场卖出', len(sells) == 1, str(ORDERS))
+    check('Y3 卖 600 留 400',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 400, str(pf.positions))
+    check('Y4 记下已止盈 2/3',
+          (S.g.entry.get(CODE) or {}).get('tp2_done') is True, str(S.g.entry.get(CODE)))
+    # 同一分钟之后再回落也不该再卖（剩下的 1/3 只跟 20 日线）
+    ctx.current_dt = datetime.datetime(2024, 6, 3, 11, 0)
+    S.handle_data(ctx, {CODE: Obj(close=27.00)})
+    check('Y5 剩下的 1/3 盘中不会因为"到目标价"再被卖',
+          len([x for x in ORDERS if x[0] == 'sell']) == 1, str(ORDERS))
+
+    print('\n[场景 Z] 同样是高开跳过目标价，但盘中一直没回落 → 不卖')
+    ctx, pf = run_hold(now_price=28.80, now_vol=1500.0, shares=1000, target=27.95,
+                       day_open=28.60, day_high=29.00, day_low=28.20)
+    ctx.current_dt = datetime.datetime(2024, 6, 3, 10, 30)
+    S.handle_data(ctx, {CODE: Obj(close=28.50)})
+    check('Z1 盘中没到目标价 → 不卖',
+          len([x for x in ORDERS if x[0] == 'sell']) == 0, str(ORDERS))
+    check('Z2 1000 股原样持有',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 1000, str(pf.positions))
+
+    print('\n[场景 Z2] 开盘价低于目标价(27.00)，盘中涨到 27.95 → 盘中当场卖 2/3')
+    ctx, pf = run_hold(now_price=27.00, now_vol=1500.0, shares=1000, target=27.95,
+                       day_open=27.00, day_high=27.00, day_low=26.90)
+    n_before = len([x for x in ORDERS if x[0] == 'sell'])
+    check('Z2a 14:55 没卖（当日最高价只有 27.00 < 27.95）',
+          n_before == 0, str(ORDERS))
+    check('Z2b 1000 股原样持有',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 1000, str(pf.positions))
+    ctx.current_dt = datetime.datetime(2024, 6, 3, 10, 30)
+    S.handle_data(ctx, {CODE: Obj(close=27.95)})
+    check('Z2c 盘中涨到目标价 → 当场卖出',
+          len([x for x in ORDERS if x[0] == 'sell']) == 1, str(ORDERS))
+    check('Z2d 卖 600 留 400',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 400, str(pf.positions))
+    check('Z2e 记下已止盈 2/3',
+          (S.g.entry.get(CODE) or {}).get('tp2_done') is True, str(S.g.entry.get(CODE)))
+
+    print('\n[场景 Z3] 开盘价低于目标价，盘中涨到 27.50 还没到 27.95 → 继续等，不卖')
+    ctx, pf = run_hold(now_price=27.20, now_vol=1500.0, shares=1000, target=27.95,
+                       day_open=27.00, day_high=27.20, day_low=26.90)
+    ctx.current_dt = datetime.datetime(2024, 6, 3, 10, 30)
+    S.handle_data(ctx, {CODE: Obj(close=27.50)})
+    check('Z3 没到目标价 → 不卖',
+          len([x for x in ORDERS if x[0] == 'sell']) == 0, str(ORDERS))
+
+    print('\n[场景 Z4] 盘中已经跌破前低(22.50) → 止损不在这里做，留给 14:55')
+    ctx, pf = run_hold(now_price=28.80, now_vol=1500.0, shares=1000, target=27.95,
+                       day_open=28.60, day_high=29.00, day_low=28.20)
+    ctx.current_dt = datetime.datetime(2024, 6, 3, 10, 30)
+    S.handle_data(ctx, {CODE: Obj(close=22.00)})
+    check('Z4a 跌破前低时不盘中卖',
+          len([x for x in ORDERS if x[0] == 'sell']) == 0, str(ORDERS))
+    check('Z4b 1000 股还在',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 1000, str(pf.positions))
+
+    print('\n[场景 Z5] 高开回落到目标价(26.50)，但目标价低于 20 日线 → 盘中全卖')
+    ctx, pf = run_hold(now_price=27.00, now_vol=1500.0, shares=1000, target=26.50,
+                       day_open=27.00, day_high=27.00, day_low=26.90)
+    check('Z5a 14:55 没卖',
+          len([x for x in ORDERS if x[0] == 'sell']) == 0, str(ORDERS))
+    ctx.current_dt = datetime.datetime(2024, 6, 3, 10, 30)
+    S.handle_data(ctx, {CODE: Obj(close=26.50)})
+    check('Z5b 盘中触发止盈且全卖（不留 1/3）',
+          len([x for x in ORDERS if x[0] == 'sell']) == 1
+          and (pf.positions.get(CODE) is None
+               or pf.positions[CODE].total_amount == 0), str(ORDERS))
 
     print('\n' + '=' * 60)
     total = PASSED[0] + len(FAILED)
