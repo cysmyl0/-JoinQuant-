@@ -14,16 +14,22 @@
 1.  L 的取法：下跌段中【最后一根】满足下面三条的阴线，L = 它的开盘价（实体上沿）
       a) 阴线：close < open
       b) 实体跌幅 > 1% 股价：(open - close) / close > 1%
-      c) 与前一根实体不重叠 > 1% 股价：(前一根实体下沿 - 本根实体上沿) > 1% × close
+      c) 与前一根实体【重合】不超过 1% 股价：(本根实体上沿 - 前一根实体下沿) ≤ 1% × close
+         即允许贴住甚至小幅重叠，只要重叠量不到 1% 就不算破坏；缺口当然更算过。
+         例：25 块则不可重叠 0.25，重叠 0.20 可以，重叠 0.30 不行。
          （跌停板豁免：本根跌幅 ≥ 9.8% 时，c) 不作要求）
 2.  站上 L：收盘价 > L，严格大于，不含盘中，14:55 的价视为当日收盘价。
 3.  窗口：从 L 之后第 1 根起数，含买入当天、不含 L。
        - 无放缓：4 根，即 L 后第 4 根仍未过 L 则作废
-       - 有放缓：6 根。放缓 = L 之后出现连续 3 根 |涨跌幅| ≤ 1% 的窄幅 K 线（视为 1 根）
+       - 有放缓：6 根。放缓 = L 之后出现连续 3 根窄幅 K 线（视为 1 根）
+         窄幅 = 今天收盘价相对昨天收盘价的偏离 ≤ 1%，收盘对收盘，不看实体大小，也不是 (开-收)/收
+          另：这 3 根的实体彼此也要"重合不超过 1%"，压过 1% 视为已开始反转 → 不算放缓，窗口仍是 4 根
 4.  量能：MA5(VOL)×(1-10%) < 当日 VOL < 2 × MA10(VOL)
        ← 必须放量过 5 日均量（给 10% 容差：当日量 > 均量的 90% 就算过），且不到 2 倍 10 日均量
        （MA5/MA10 取截至前一根已收盘K线的均量；当日 VOL 用 14:55 时点的当日累计量估计全日量）
 5.  不创新低：14:55 价 ≥ P_low，P_low = 从 L 到买入前一天的最低收盘价
+        （若期间出现"反转那根"——实体重合超过 1% 的第一根K线——则只取 L 到那根为止的最低收盘价，
+         之后更低的回踩不再下移止损位）
 5b. 站上那根要够强：站上 L 的那根上涨K线，涨幅（相对前一天收盘）> 1%
        ← 原文"（阴线的下跌值>1%的股价，上涨的k线也要>1%）"
 6.  盈亏比：目标 = 买入价上方最近的强压力区；盈亏比 = (目标 - 买入) / (买入 - P_low) 必须 ≥ 2
@@ -70,7 +76,7 @@
 【用户已默认接受的实现假设（可在一处改）】
 - 急跌条件（原文三条，逐条落到代码里，后两条可用开关关掉）：
     ① 至少 3 根连续收跌，且区间累计跌幅 ≥ 3%（把"下跌比较猛"量化）
-    ② 段内每相邻两根K线实体不重叠 > 1% 股价（跳空下跌），跌停板豁免   ← REQUIRE_GAP
+    ② 段内每相邻两根K线实体【重合不超过 1% 股价】（贴住/小重叠/跳空都算过），跌停板豁免   ← REQUIRE_GAP
     ③ 第一根跌幅 > 1% 或 收盘破前 20 根最低收盘                        ← REQUIRE_FIRST_DROP
 - A 股 1 手 = 100 股，手工取整；单票仓位上限 25%，最多同时持有 5 只
 - 卖出遇到跌停（价格 ≤ 跌停价×1.001）、买入遇到涨停（价格 ≥ 涨停价×0.999）则放弃该笔
@@ -92,10 +98,11 @@ except Exception:                        # 本地跑单测时允许缺失
 
 # ---------- 规则参数（对应你确认的口径，一般不要改） ----------
 PCT          = 0.01     # "1% 股价"的百分比
-BODY_GAP_PCT = 0.01     # 实体不重叠要求的比例（1%）
+BODY_GAP_PCT = 0.01     # 实体【重合】上限比例（1%），超过才算破坏结构
 LIMIT_DROP   = 0.098    # 跌停豁免阈值：单根跌幅 ≥ 9.8% 视为跌停
-NARROW_PCT   = 0.01     # 放缓：单根涨跌幅绝对值 ≤ 1%
+NARROW_PCT   = 0.01     # 放缓：今天收盘价相对昨天收盘价的偏离 ≤ 1%（收盘对收盘，不是实体大小）
 NARROW_RUN   = 3        # 放缓：连续 3 根
+NARROW_OVERLAP = True   # 放缓：这 3 根彼此的实体也要【重合不超过 1%】，压过 1% 视为已开始反转 → 不算放缓
 W_NO_SLOW    = 4        # 无放缓 → 窗口 4 根
 W_SLOW       = 6        # 有放缓 → 窗口 6 根
 VOL_S        = 5        # 短均量 5 日
@@ -110,7 +117,7 @@ REQUIRE_STAND_GAIN = True  # 站上 L 的那根上涨K线，涨幅必须 > STAND
 STAND_GAIN_PCT = 0.01   # 原文"上涨的k线也要>1%"
 DECLINE_BARS = 3        # 急跌：至少连续下跌根数
 DECLINE_PCT  = 0.03     # 急跌：累计跌幅至少 3%（把原文"下跌比较猛"量化）
-REQUIRE_GAP        = True   # 急跌：下跌段每相邻两根K线实体必须不重叠 >1%（跳空下跌），跌停豁免
+REQUIRE_GAP        = True   # 急跌：下跌段每相邻两根K线实体重合不超过 1%（贴住/小重叠/跳空都算过），跌停豁免
 REQUIRE_FIRST_DROP = True   # 急跌：下跌段第一根跌幅 >1% 或 收盘破前低
 FIRST_DROP_BACK    = 20     # "破前低"参照的前 N 根最低收盘价
 LOOKBACK_L   = 10       # 只在最近 10 根里找有效大阴线 L（否则 L 太老无意义）
@@ -165,7 +172,7 @@ def is_bear(o, c, i):
 
 
 def is_limit_down(c, i):
-    """第 i 根是否近似跌停（用于实体不重叠豁免）。"""
+    """第 i 根是否近似跌停（用于实体重合豁免）。"""
     if i < 1:
         return False
     return c[i] <= c[i - 1] * (1.0 - LIMIT_DROP)
@@ -179,16 +186,49 @@ def body_top(o, c, i):
     return max(o[i], c[i])
 
 
+def body_overlap(o, c, prev, i):
+    """
+    第 i 根实体相对前一根(prev)实体的【重合量】（价格计）：
+        本根实体上沿 - 前一根实体下沿
+    > 0 表示两根实体有重合，< 0 表示有跳空缺口。
+    """
+    return body_top(o, c, i) - body_low(o, c, prev)
+
+
+def overlap_ok(o, c, prev, i, tol=None):
+    """
+    原文「K 线实体不重叠超过 1%，例如股票 25 块则不可重叠 0.25」：
+    允许两根实体最多重合 tol × 股价，超过才算破坏结构（贴住、有缺口都算过）。
+    tol=None 时读全局 PCT。
+    """
+    if tol is None:
+        tol = PCT
+    return body_overlap(o, c, prev, i) <= tol * float(c[i])
+
+
+def find_reversal_idx(o, c, L_idx, n=None):
+    """
+    第一根"开始反转"的K线：实体上沿高出前一根实体下沿 > 1% 股价（也就是重合超过 1%）。
+    磨底阶段的K线都贴在前一根实体下沿附近，一旦有根K线明显往上顶，就是反转开始。
+    找不到（磨底到昨天都没往上顶过）返回 None。
+    """
+    if n is None:
+        n = len(c)
+    for t in range(L_idx + 1, n):
+        if not overlap_ok(o, c, t - 1, t):
+            return t
+    return None
+
+
 def is_valid_bear(o, c, i):
-    """第 i 根是否为"有效大阴线"（阴线 + 实体跌幅>1% + 与前一根实体不重叠>1%，跌停豁免）。"""
+    """第 i 根是否为"有效大阴线"（阴线 + 实体跌幅>1% + 与前一根实体重合不超过1%，跌停豁免）。"""
     if i < 1:
         return False
     if not is_bear(o, c, i):
         return False
     if (o[i] - c[i]) / c[i] <= PCT:                 # 实体跌幅不够
         return False
-    gap = body_low(o, c, i - 1) - body_top(o, c, i)  # 与前一根实体的垂直间隙
-    if gap <= PCT * c[i] and not is_limit_down(c, i):
+    if not overlap_ok(o, c, i - 1, i) and not is_limit_down(c, i):
         return False
     return True
 
@@ -221,12 +261,11 @@ def decline_run_start(c, L_idx):
 
 def has_body_gaps(o, c, start, end):
     """
-    下跌段 [start, end] 内，每相邻两根K线的实体都不重叠（间隙 > 1% 股价）。
-    跌停板豁免（原文"跌停板可以除外"）。
+    下跌段 [start, end] 内，每相邻两根实体【重合都不超过 1% 股价】（贴住/缺口都算过），
+    原文："K 线实体不重叠超过 1%"。跌停板豁免（原文"跌停板可以除外"）。
     """
     for t in range(start + 1, end + 1):
-        gap = body_low(o, c, t - 1) - body_top(o, c, t)
-        if gap <= PCT * c[t] and not is_limit_down(c, t):
+        if not overlap_ok(o, c, t - 1, t) and not is_limit_down(c, t):
             return False
     return True
 
@@ -252,7 +291,7 @@ def is_sharp_decline(o, c, L_idx):
     """
     急跌判定（按原文三条，可开关）：
       ① 至少 DECLINE_BARS 根连续收跌，且累计跌幅 ≥ DECLINE_PCT（"下跌比较猛"）
-      ② REQUIRE_GAP=True 时：段内每相邻两根实体不重叠 > 1% 股价（跳空下跌，跌停豁免）
+      ② REQUIRE_GAP=True 时：段内每相邻两根实体重合不超过 1% 股价（贴住/小重叠/跳空都算过，跌停豁免）
       ③ REQUIRE_FIRST_DROP=True 时：第一根跌幅 > 1% 或 破前低
     """
     if L_idx < 1:
@@ -275,9 +314,13 @@ def is_sharp_decline(o, c, L_idx):
     return True
 
 
-def slow_run_ok(c, L_idx, n=None):
+def slow_run_ok(o, c, L_idx, n=None):
     """
-    放缓判定：L 之后的窗口内，存在连续 NARROW_RUN 根 |涨跌幅| ≤ NARROW_PCT 的窄幅K线。
+    放缓判定：L 之后的窗口内，存在连续 NARROW_RUN 根窄幅K线，且这几根彼此实体【重合不超过 1%】。
+      窄幅   = abs(c[t]/c[t-1] - 1) <= NARROW_PCT，即【今天收盘价相对昨天收盘价】的偏离，
+               不是 (开-收)/收 那种实体涨跌幅，也不看实体大小。
+      不重合 = overlap_ok()：实体上沿 - 前一根实体下沿 <= 1%×close。
+               实体压过 1%（含跳空/长影线）说明已经开始反转，不算放缓 → 窗口仍是 4 根。
     n = 已收盘K线数量（索引 0..n-1）。
     """
     if n is None:
@@ -290,7 +333,10 @@ def slow_run_ok(c, L_idx, n=None):
         ok = True
         for t in range(k, k + NARROW_RUN):
             r = c[t] / c[t - 1] - 1.0
-            if abs(r) > NARROW_PCT:
+            if abs(r) > NARROW_PCT:          # 收盘对收盘偏太多 → 不算窄幅
+                ok = False
+                break
+            if NARROW_OVERLAP and not overlap_ok(o, c, t - 1, t):   # 实体重合超过 1% → 已经在走，不是磨底
                 ok = False
                 break
         if ok:
@@ -298,9 +344,9 @@ def slow_run_ok(c, L_idx, n=None):
     return False
 
 
-def window_size(c, L_idx, n=None):
+def window_size(o, c, L_idx, n=None):
     """返回窗口根数：有放缓 6，无放缓 4。"""
-    return W_SLOW if slow_run_ok(c, L_idx, n) else W_NO_SLOW
+    return W_SLOW if slow_run_ok(o, c, L_idx, n) else W_NO_SLOW
 
 
 def detect_setup(o, c, h, l, v):
@@ -325,14 +371,20 @@ def detect_setup(o, c, h, l, v):
         return None
 
     L = float(o[Li])
-    p_low = float(np.min(c[Li:]))          # 从 L 到昨天收盘的最低价（收盘价口径）
+    # 前低（止损位）：默认取 L 到昨天的最低收盘价；
+    # 一旦出现"开始反转"的那根K线（实体重合超过 1%），前低冻结为 L 到那根之间的最低收盘价，
+    # 之后磨底/回踩的更低收盘价不再下移止损位（否则反转之后随便一个小坑都会把止损拉低、把盈亏比算差）。
+    p_low = float(np.min(c[Li:]))
+    rev = find_reversal_idx(o, c, Li, n)
+    if rev is not None:
+        p_low = float(np.min(c[Li:rev + 1]))
 
     # 窗口内此前已经站上过 L → 结构已经触发过，今天不再买
     for t in range(Li + 1, n):
         if c[t] > L:
             return None
 
-    wlen = window_size(c, Li, n)
+    wlen = window_size(o, c, Li, n)
     wleft = Li + wlen - n                  # 今天(索引 n)是第几根：>=0 表示还在窗口内
     if wleft < 0:
         return None
@@ -1515,16 +1567,18 @@ def _do_buy(context, today, picks):
 # 原文                                     代码
 # ---------------------------------------- ------------------------------------
 # 阴线的下跌值 > 1% 的股价                   is_valid_bear() 的 (o-c)/c > 1%
-# K线实体不重叠超过1%（25元→0.25）           is_valid_bear() 的 gap > 1%×close
+# K线实体重合不超过1%（25元→0.25）           is_valid_bear() 的 overlap_ok()：实体上沿-前实体下沿 ≤ 1%×close
 # 跌停板可以除外                            is_valid_bear() 的 is_limit_down()
 # 倒数第二根阴线 → L                        find_L() 最后一根有效大阴线，L = open
 # 至少三根K线下跌比较猛                      is_sharp_decline()：连跌≥3根且累计≥3%
-# 段内实体互不重叠（跳空下跌）               has_body_gaps()，REQUIRE_GAP 开关
+# 段内实体重合都不超过1%（贴住/跳空）        has_body_gaps()，REQUIRE_GAP 开关
 # 第一根跌幅>1%或破前低                     first_bar_sharp()，REQUIRE_FIRST_DROP 开关
 # 四根k线内完全站上                        detect_setup() 的窗口 wleft >= 0
 # 上涨的k线也要 >1%（站上那根的涨幅）        stand_gain_ok()，REQUIRE_STAND_GAIN 开关
 # 连续三根k线在1%以内算放缓                  slow_run_ok()：窗口放宽到 6 根
+# 放缓的3根也不能重合超过1%（否则是反转）    slow_run_ok() 里再过 overlap_ok()，NARROW_OVERLAP 开关
 # 同时不可以创新低                          no_new_low()：price >= p_low
+# 反转那根出现后前低冻结                    find_reversal_idx()：p_low 只取 L 到反转那根
 # 价格到达压力区就卖出                       target_hit() 判到价；sell_decision() 决定卖多少
 # 持仓期高开在目标价之上 → 不卖等回落          target_hit()：开盘>目标 且 当日最低>目标 → 不卖（GAP_UP_HOLD）
 # 到目标价止盈改到盘中执行              handle_data()：每分钟判 到价 → 当场卖（GAP_WATCH_SELL）

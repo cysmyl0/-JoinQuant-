@@ -24,8 +24,8 @@
       最高价之前的重合不算 / 单根2倍量整根算 / 没有放量K线则无
  16  卖出逻辑：T+1、止损、止盈
  17  持仓放量减仓：当日量 > 2×MA10 才减、1/3 取整到 100 股、不足 2 手不减
- 18  急跌三条口径：首尾相接不算 / 跳空才算 / 第一根不足1%且没破前低不算 /
-      破了前低就算 / 跌停板豁免缺口
+ 18  急跌三条口径：实体重合 ≤1% 才算（缺口/贴住/小幅重叠都算）/ 重合 >1% 不算 /
+      第一根不足1%且没破前低不算 / 破了前低就算 / 跌停板豁免重叠
  19  站上 L 那根上涨K线的涨幅必须 > 1%（原文"上涨的k线也要>1%"）
  20  标的池剔除 ST / *ST（is_st 接口优先，退化按简称，接口挂了不乱杀）
  21  止盈：到压力区卖 2/3、留 1/3 跟 20 日线、不够拆全卖
@@ -99,21 +99,32 @@ def run():
     check('1 找到 L 且 L=开盘价', i == L_IDX and abs(o[i] - L_PRICE) < 1e-9,
           'i=%s L=%s' % (i, None if i is None else o[i]))
 
-    # 2 间隙 0.20 < 0.254（1%×25.40）→ 无效
+    # 2 有跳空缺口（实体不重合）→ 有效（原文只限制"重合"上限，不要求缺口）
     o2, c2, _, _, _ = mk([bar(27.00, 26.00), bar(25.80, 25.40)])
-    check('2 实体间隙不足', S.is_valid_bear(o2, c2, 1) is False, 'gap=0.20 need 0.254')
-    # 对照：间隙 0.30 > 0.254 → 有效
-    o3, c3, _, _, _ = mk([bar(27.00, 26.00), bar(25.70, 25.40)])
-    check('2b 实体间隙足够 → 有效', S.is_valid_bear(o3, c3, 1) is True)
+    check('2 有跳空缺口 → 有效', S.is_valid_bear(o2, c2, 1) is True, 'gap=0.20')
+    # 2b 首尾相接（重合 0）→ 有效
+    o3, c3, _, _, _ = mk([bar(27.00, 26.00), bar(26.00, 25.40)])
+    check('2b 首尾相接（重合0）→ 有效', S.is_valid_bear(o3, c3, 1) is True)
+    # 2c 重合 0.20 = 0.79%×25.40 ≤ 1% → 有效
+    o3b, c3b, _, _, _ = mk([bar(27.00, 26.00), bar(26.20, 25.40)])
+    check('2c 重合 0.20（0.79%）→ 有效', S.is_valid_bear(o3b, c3b, 1) is True,
+          'overlap=%s need ≤%s' % (S.body_overlap(o3b, c3b, 0, 1),
+                                   S.PCT * c3b[1]))
+    # 2d 重合 0.30 = 1.18% > 1% → 无效
+    o3c, c3c, _, _, _ = mk([bar(27.00, 26.00), bar(26.30, 25.40)])
+    check('2d 重合 0.30（1.18%）→ 无效', S.is_valid_bear(o3c, c3c, 1) is False,
+          'overlap=%s > %s' % (S.body_overlap(o3c, c3c, 0, 1),
+                               S.PCT * c3c[1]))
 
     # 3 跌幅 0.39% ≤ 1% → 无效
     o4, c4, _, _, _ = mk([bar(27.00, 26.00), bar(25.60, 25.50)])
     check('3 实体跌幅不足1%', S.is_valid_bear(o4, c4, 1) is False, 'drop=0.39%')
 
-    # 4 跌停豁免：实体零间隙但跌幅 10%
-    o5, c5, _, _, _ = mk([bar(27.00, 26.00), bar(26.00, 23.40)])
+    # 4 跌停豁免：实体重合 0.50 > 1%（0.234）但跌幅 12.3% → 豁免 → 有效
+    o5, c5, _, _, _ = mk([bar(27.00, 26.00), bar(26.50, 23.40)])
     check('4 跌停板豁免', S.is_valid_bear(o5, c5, 1) is True,
-          'is_limit_down=%s' % S.is_limit_down(c5, 1))
+          'overlap=%s is_limit_down=%s' % (S.body_overlap(o5, c5, 0, 1),
+                                           S.is_limit_down(c5, 1)))
 
     # 5 阳线 → 无效
     o6, c6, _, _, _ = mk([bar(27.00, 26.00), bar(25.00, 25.50)])
@@ -132,7 +143,7 @@ def run():
     rows7 = rows6 + [bar(24.00, 24.00)]
     o, c, h, l, v = mk(rows7)
     check('7 第5根失效', S.detect_setup(o, c, h, l, v) is None
-          and S.window_size(c, L_IDX) == 4)
+          and S.window_size(o, c, L_IDX) == 4)
 
     # 8 有放缓：连续 3 根 ±1% 内 → 窗口 6 根，同样 4 根仍有 wleft=1（n=38）
     rows8 = BASE + [bar(24.20, 24.20), bar(24.25, 24.25),
@@ -146,12 +157,52 @@ def run():
     rows9 = rows8 + [bar(24.15, 24.15), bar(24.45, 24.45)]
     o, c, h, l, v = mk(rows9)
     check('9 放缓后第7根失效', S.detect_setup(o, c, h, l, v) is None
-          and S.window_size(c, L_IDX) == 6)
+          and S.window_size(o, c, L_IDX) == 6)
+
+    # 8b 三根收盘都在 ±1% 内，但其中一根实体压过前一根 1% → 不算放缓（窗口仍 4 根）
+    rows8b = BASE + [bar(24.60, 24.20),   # 高开长上影：收盘 +0.83% 算窄幅，但实体压过 L 0.60（2.5%）
+                     bar(24.15, 24.20),
+                     bar(24.25, 24.30)]
+    o, c, h, l, v = mk(rows8b)
+    check('8b 窄幅但实体重合>1% → 不算放缓',
+          S.slow_run_ok(o, c, L_IDX) is False and S.window_size(o, c, L_IDX) == 4,
+          'overlap(33,34)=%s' % S.body_overlap(o, c, 33, 34))
+    # 8c 同样三根收盘，把第一根改成贴合（实体不压过 1%）→ 算放缓
+    rows8c = BASE + [bar(24.20, 24.20),
+                     bar(24.15, 24.20),
+                     bar(24.25, 24.30)]
+    o, c, h, l, v = mk(rows8c)
+    check('8c 窄幅且实体贴合 → 放缓 6 根', S.window_size(o, c, L_IDX) == 6,
+          'wlen=%s' % S.window_size(o, c, L_IDX))
 
     # 10 窗口内已站上过 L → 结构已触发，不再追
     rows10 = BASE + [bar(25.10, 25.10), bar(25.00, 25.00)]
     o, c, h, l, v = mk(rows10)
     check('10 已触发不追', S.detect_setup(o, c, h, l, v) is None, 'close>L at idx34')
+
+    print('\n[10b] 前低：出现反转那根后冻结，不再被后面的回踩拉低')
+    # 34 磨底（贴在下沿）→ 35 往上顶出 2.0%（反转那根）→ 36 回踩更深（收盘 23.90 低于此前最低 24.00）
+    rows10b = BASE + [bar(24.20, 24.20),
+                      bar(24.50, 24.70),
+                      bar(24.10, 23.90)]
+    o, c, h, l, v = mk(rows10b)
+    st = S.detect_setup(o, c, h, l, v)
+    check('10b 反转后前低冻结在反转之前',
+          st is not None and abs(st['p_low'] - 24.00) < 1e-9
+          and S.find_reversal_idx(o, c, L_IDX) == 35,
+          'p_low=%s rev=%s（不冻结会是 23.90）'
+          % (None if st is None else st['p_low'], S.find_reversal_idx(o, c, L_IDX)))
+    # 三根都贴在下沿、没有一根往上顶 → 没有反转，前低照旧取全部最低
+    rows10c = BASE + [bar(24.20, 24.10),
+                      bar(24.15, 24.05),
+                      bar(24.10, 23.90)]
+    o, c, h, l, v = mk(rows10c)
+    st = S.detect_setup(o, c, h, l, v)
+    check('10c 没有反转那根 → 前低取全部最低',
+          st is not None and abs(st['p_low'] - 23.90) < 1e-9
+          and S.find_reversal_idx(o, c, L_IDX) is None,
+          'p_low=%s rev=%s' % (None if st is None else st['p_low'],
+                               S.find_reversal_idx(o, c, L_IDX)))
 
     print('\n[11] 急跌判定')
     o, c, h, l, v = mk(BASE)
@@ -407,13 +458,30 @@ def run():
     print('\n[18] 急跌三条口径（可开关）')
     g0, f0 = S.REQUIRE_GAP, S.REQUIRE_FIRST_DROP
     try:
-        # 18a/18b 首尾相接（实体零缺口）三连阴：按原文不算急跌，关掉缺口要求才算
+        # 18a/18b 首尾相接（重合 0）三连阴：按"重合上限"新口径 → 算急跌
         o, c, h, l, v = mk(pad(5, price=30.0) +
                            [bar(30.00, 29.60), bar(29.60, 29.20), bar(29.20, 28.80)])
         S.REQUIRE_GAP = True
-        check('18a 首尾相接无缺口 → 不算急跌', S.is_sharp_decline(o, c, 7) is False)
+        check('18a 首尾相接（重合0）→ 算急跌', S.is_sharp_decline(o, c, 7) is True)
         S.REQUIRE_GAP = False
-        check('18b 关掉缺口要求 → 算急跌', S.is_sharp_decline(o, c, 7) is True)
+        check('18b 关掉缺口要求 → 仍算急跌', S.is_sharp_decline(o, c, 7) is True)
+        S.REQUIRE_GAP = True
+
+        # 18b2 每根小幅重叠 0.20（约 0.7%×29 元）→ 仍在 1% 以内 → 算
+        o, c, h, l, v = mk(pad(5, price=30.0) +
+                           [bar(30.00, 29.60), bar(29.80, 29.00), bar(29.20, 28.40)])
+        check('18b2 小幅重叠 0.20（<1%）→ 算急跌',
+              S.is_sharp_decline(o, c, 7) is True,
+              'ov=%s,%s 限=%s' % (S.body_overlap(o, c, 5, 6),
+                                  S.body_overlap(o, c, 6, 7), S.PCT * c[7]))
+
+        # 18b3 重叠 1.00（约 3.3%×30 元）> 1% → 不算；关掉 REQUIRE_GAP 才算
+        o, c, h, l, v = mk(pad(5, price=30.0) +
+                           [bar(30.00, 29.60), bar(30.60, 29.00), bar(29.00, 28.40)])
+        check('18b3 重叠 1.00（>1%）→ 不算急跌',
+              S.is_sharp_decline(o, c, 7) is False)
+        S.REQUIRE_GAP = False
+        check('18b4 关掉缺口要求 → 算急跌', S.is_sharp_decline(o, c, 7) is True)
         S.REQUIRE_GAP = True
 
         # 18c 跳空三连阴（每根之间实体缺口 > 1%）→ 算
@@ -438,10 +506,12 @@ def run():
         check('18f 第一根跌0.67%但破前低 → 算急跌',
               S.is_sharp_decline(o, c, 22) is True)
 
-        # 18g 三根跌停板（实体完全重叠，零缺口）→ 跌停豁免 → 算
+        # 18g 三根跌停板（第 2 根实体上沿压进第 1 根 1.00 > 1%）→ 跌停豁免 → 算
         o, c, h, l, v = mk(pad(5, price=30.0) +
-                           [bar(30.00, 27.00), bar(27.00, 24.30), bar(24.30, 21.87)])
-        check('18g 跌停板豁免缺口 → 算急跌', S.is_sharp_decline(o, c, 7) is True)
+                           [bar(30.00, 27.00), bar(28.00, 24.30), bar(24.30, 21.87)])
+        check('18g 跌停板豁免重叠 → 算急跌', S.is_sharp_decline(o, c, 7) is True,
+              'overlap=%s limit=%s' % (S.body_overlap(o, c, 6, 7),
+                                       S.is_limit_down(c, 7)))
     finally:
         S.REQUIRE_GAP, S.REQUIRE_FIRST_DROP = g0, f0
 
