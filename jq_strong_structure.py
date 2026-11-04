@@ -28,14 +28,15 @@
        ← 必须放量过 5 日均量（给 10% 容差：当日量 > 均量的 90% 就算过），且不到 2 倍 10 日均量
        （MA5/MA10 取截至前一根已收盘K线的均量；当日 VOL 用 14:55 时点的当日累计量估计全日量）
 5.  不创新低：14:55 价 ≥ P_low，P_low = 从 L 到买入前一天的最低收盘价
-        （若期间出现"反转那根"——实体重合超过 1% 的第一根K线——则只取 L 到那根为止的最低收盘价，
+        （若期间出现"反转那根"——实体重合超过 1% 且没创新低的第一根K线——则只取 L 到那根为止的最低收盘价，
          之后更低的回踩不再下移止损位）
+        若出现"重合超 1% 又创新低"的K线 → 下跌还没走完，旧 L 作废（新的下跌结构，重新数三根急跌）
 5b. 站上那根要够强：站上 L 的那根上涨K线，涨幅（相对前一天收盘）> 1%
        ← 原文"（阴线的下跌值>1%的股价，上涨的k线也要>1%）"
 6.  盈亏比：目标 = 买入价上方最近的强压力区；盈亏比 = (目标 - 买入) / (买入 - P_low) 必须 ≥ 2
        - 若买入价已经落在某压力区内（或正好压着下沿）→ 压力区太近，直接不买
-       - 若上方【一条压力区都没有】→ 用 250 日最高价兜底：先按固定 2:1 算目标价
-         （买入 + 2 × (买入 - P_low)），这个目标价在 250 日最高价之内就照做，
+       - 若上方【一条压力区都没有】→ 用 120 日最高价兜底：先按固定 2:1 算目标价
+         （买入 + 2 × (买入 - P_low)），这个目标价在 120 日最高价之内就照做，
          连 2:1 的空间都没有就不买（USE_HIGH_FALLBACK 开关）
 7.  强压力区：只有【下降波段】才有压力，一旦被上涨收复，压力就释放了
        - 先过"收复"筛子：某根K线之后若出现过更高的最高价（≥ 本根最高价，整根被覆盖）
@@ -45,7 +46,7 @@
        - 价格区间用整根K线的最高/最低，**影线和实体都算**（不是只看收盘价）
        - 放量 = 该根成交量 > 买入当天量 V0
        - 窗口内任意一根成交量 ≥ 2 × V0 → 这一根本身整段也算强压力区
-       - 前高（最近一次下跌的起点）左边 3 根K线整根【无条件】算压力区
+       - 每一段下跌的起点（每个"后面再没被超过的峰"）左边 3 根K线整根【无条件】算压力区
          —— 顶部供给，上涨也释放不掉
        - 目标 = 买入价上方最近的那条压力区的【下沿】（价格第一次碰到压力区的价位）
 8.  否决项：成交量 ≥ 2 倍 10 日均量的 K 线（买入当天）不买
@@ -53,11 +54,16 @@
         - 剔除 ST / *ST、剔除停牌、上市满 3 年（1095 个自然日）；不做市值/价格过滤
         - 不含创业板(300/301)、科创板(688/689)、北交所、B股
 10. 所有买入和卖出都在每天 14:55 执行（1 分钟级回测 + run_daily 定时任务）
-11. 持仓期间：某天成交量 > 2 × MA10(VOL)（与第 4 条同一条线的另一侧）→ 当天卖出 1/3 持仓
+11. 持仓期间：某天成交量 > 2 × MA10(VOL)（与第 4 条同一条线的另一侧）→ 当天减仓
        - 先看止盈/止损，两者都没触发才减仓；同一天不会既减仓又清仓
-       - 1/3 向下取整到 100 股整手；持仓不足 200 股不减（留给止盈/止损一次清掉）
-       - 同一条规则可以多次触发：每次放量都是再卖 1/3（按当时的剩余持仓算）
-12. 止盈：价格到上方最近强压力区时，只卖 2/3（不是全清）：
+       - 每次减的都是【最初仓位】的 1/3（不是剩余仓位的 1/3）：1000 股 → 每次都卖 300
+       - 剩余不足 2 手（< 200 股）→ 改卖【剩余的一半】（剩 200 卖 100；再触发时剩 100，
+        一半是 50、剩 50 不足 1 手 → 直接全卖 100）
+       - 【再次触发的台阶】：第一次减仓后记下触发价 vol_anchor，之后必须
+            股价 ≥ vol_anchor × 1.05（REDUCE_REARM_GAIN，每次减仓后基准更新为本次触发价），或
+            当天相对【昨收】涨幅 > 5%（REDUCE_REARM_DAY_PCT）
+         两个都不满足就不减，避免连跌中天天爆量天天减
+12. 止盈：价格到上方最近强压力区时，卖到只剩【最初仓位的 1/3】：
        - 「到价」按 target_hit() 判（GAP_UP_HOLD=True）：
            开盘价已在目标价之上（跳空突破）→ 开盘不卖，等盘中回落到目标价（当日最低价 ≤ 目标价）才卖；
            一天都没回过目标价 → 不卖，继续持有；
@@ -66,11 +72,15 @@
            「到目标价止盈」由 handle_data() 在盘中每分钟执行（GAP_WATCH_SELL）：开盘价已在目标价之上 → 等
            回落到目标价才卖；开盘价没到目标价 → 等涨到目标价就卖。止损（跌破前低）、放量减仓、买入
            仍然只在 14:55 处理。
-       - 到压力区时价格在【20 日均线】(含当天、带 1% 容差：MA20×0.99) 上方 → 卖 2/3（整手），留 1/3
+       - 卖多少只看【最初仓位】：累计卖到 2/3 初始为止（tp_part_shares()）
+           没减过仓：1000 股 → 卖 600、留 400
+           之前因爆量减过：已减 300 剩 700 → 目标价只再卖 300（累计 600、留 400）
+           之前已卖够 2/3 → 不再卖，只打 tp2_done 标记，转入跟 20 日线
+       - 站上 20 日线（价 ≥ MA20×0.99）→ 卖到剩 1/3 最初仓位，尾巴跟 20 日线
+      - 已在线下（价 < MA20×0.99）→ 当天直接全卖，不留尾巴过夜
+      - 拿不到 20 日线数据 → 全卖
        - 剩下的 1/3：收盘价【跌破 MA20×(1-1%)】就卖掉（跟随止盈）
-       - 到压力区时价格还没过 20 日均线（价 < MA20×0.99）→ 说明反弹很弱，全部卖出
-       - 不够拆（卖完剩不足 1 手 / 2/3 凑不满 1 手）→ 直接全卖
-       - 卖过 2/3 之后，剩下的 1/3 仍然受【跌破前低止损】保护，并且【照样按放量减仓 1/3】
+       - 卖过 2/3 之后，剩下的 1/3 仍然受【跌破前低止损】保护，并且【照样按放量减仓】
        - MA20 默认含当天（MA20_INCLUDE_TODAY=True，用 14:55 价当今天收盘）
 
 【用户已默认接受的实现假设（可在一处改）】
@@ -110,7 +120,7 @@ VOL_L        = 10       # 长均量 10 日
 VOL_CAP      = 2.0      # 2 倍量
 VOL_S_TOL    = 0.10     # 买入时对"放量过 5 日均量"的容差：当日量 > MA5×(1-10%) 即算过
 RR_MIN       = 2.0      # 盈亏比 2:1
-USE_HIGH_FALLBACK = True   # 上方找不到压力区时，用"250 日最高价"兜底：空间够 2:1 就按固定 2:1 止盈
+USE_HIGH_FALLBACK = True   # 上方找不到压力区时，用"120 日最高价"兜底：空间够 2:1 就按固定 2:1 止盈
 GAP_UP_HOLD  = True     # 持仓期【开盘价已在目标价之上】（跳空突破）→ 不在开盘卖，等盘中回落到目标价再卖
 GAP_WATCH_SELL = True   # 止盈挪到盘中：handle_data 每分钟盯 "到目标价" 就卖（止损/减仓仍只在 14:55）
 REQUIRE_STAND_GAIN = True  # 站上 L 的那根上涨K线，涨幅必须 > STAND_GAIN_PCT
@@ -121,8 +131,8 @@ REQUIRE_GAP        = True   # 急跌：下跌段每相邻两根K线实体重合�
 REQUIRE_FIRST_DROP = True   # 急跌：下跌段第一根跌幅 >1% 或 收盘破前低
 FIRST_DROP_BACK    = 20     # "破前低"参照的前 N 根最低收盘价
 LOOKBACK_L   = 10       # 只在最近 10 根里找有效大阴线 L（否则 L 太老无意义）
-HIGH_BACK    = 250      # 往前找"上一个最高价"的回溯根数（压力区窗口 = 最高价那根 → 昨天）
-ZONE_KEEP_PREV_HIGH = 3 # 前高（最近一次下跌的起点）左边【无条件】保留几根K线当压力区
+HIGH_BACK    = 120      # 往前找"上一个最高价"的回溯根数（压力区窗口 = 最高价那根 → 昨天）
+ZONE_KEEP_PREV_HIGH = 3 # 每个下跌起点（前高）左边【无条件】保留几根K线当压力区
 
 # ---------- 选股 / 仓位 / 费率 ----------
 UNIVERSE     = 'main_board'  # 'main_board' 沪深主板（默认）| 'all' 全市场 | 'hs300' | 'zz500' | 'zz1000'
@@ -133,7 +143,7 @@ EXCLUDE_ST   = True     # True: 剔除 ST / *ST（用 get_extras('is_st') 判，
 MIN_LIST_YEARS = 3      # 上市满 3 年才纳入
 MIN_LIST_DAYS = 365 * MIN_LIST_YEARS   # = 1095 个自然日（按自然日算，不是交易日）
 BARS_SCAN    = 60       # 第一步扫描用日线根数（够算 detect_setup + 均量）
-BARS_FULL    = 300      # 第二轮算强压力区用日线根数（需覆盖 HIGH_BACK）
+BARS_FULL    = 200      # 第二轮算强压力区用日线根数（需覆盖 HIGH_BACK=120，留点余量）
 MAX_CAND     = 500      # 单日候选上限（控制 14:55 的耗时）
 MAX_POS      = 5        # 最多同时持有 5 只
 MAX_POS_PCT  = 0.25     # 单票最多占总资产 25%
@@ -144,14 +154,16 @@ MIN_COMM     = 5        # 最低佣金 5 元
 MAX_HOLD_DAYS = 0       # 最大持有天数，0 = 不启用
 
 # ---------- 持仓中的减仓规则（m00216 新增） ----------
-REDUCE_RATIO   = 1.0 / 3.0   # 当日量 > 该倍数时，卖出 1/3 持仓
+REDUCE_RATIO   = 1.0 / 3.0   # 每次减仓卖出【最初仓位】的 1/3（剩余不足 2 手时改卖一半，卖完剩不足 1 手就清仓）
 REDUCE_VOL_CAP = 2.0         # 触发减仓的量能倍数：当日量 > 2 × MA10(量)
 REDUCE_LOT     = 100         # 减仓股数取整手
+REDUCE_REARM_GAIN = 1.05     # 再次减仓的台阶：股价要 ≥ 上次减仓价 × 1.05
+REDUCE_REARM_DAY_PCT = 0.05  # 或者当天相对昨收涨幅 > 5%
 
-# ---------- 止盈：到压力区只卖 2/3，剩下 1/3 跟 20 日线 ----------
-TP_FOLLOW_MA = True       # True: 到压力区卖 2/3 留 1/3 跟着 20 日线走；False: 到压力区全清（旧行为）
-TP_RATIO     = 2.0 / 3.0  # 到压力区卖掉的占比
-TP_LOT       = 100        # 止盈卖出取整手
+# ---------- 止盈：到压力区只卖到剩 1/3【最初仓位】，尾巴跟 20 日线 ----------
+TP_FOLLOW_MA = True       # True: 到压力区卖到剩 1/3 跟 20 日线；False: 到压力区全清（旧行为）
+TP_RATIO     = 2.0 / 3.0  # 到压力区时，累计应卖掉的最初仓位占比
+TP_LOT       = 100        # 止盈卖出取整手（`tp_part_shares()` 用）
 MA20_N       = 20         # 跟踪止盈用的均线天数
 MA20_INCLUDE_TODAY = True   # MA20 是否把今天(14:55 价)算进去；True = 含当天（更贴近实盘）
 MA20_TOL     = 0.01       # 跌破 20 日均线的容差：价 < MA20×(1-1%) 才算真跌破（过了线不算）
@@ -206,16 +218,25 @@ def overlap_ok(o, c, prev, i, tol=None):
     return body_overlap(o, c, prev, i) <= tol * float(c[i])
 
 
+def makes_new_low(c, lo, i):
+    """第 i 根收盘价是否创了 lo..i-1 的新低（收盘价口径，和前低 p_low 同一把尺）。"""
+    if i <= lo:
+        return False
+    return float(c[i]) < float(np.min(c[lo:i]))
+
+
 def find_reversal_idx(o, c, L_idx, n=None):
     """
-    第一根"开始反转"的K线：实体上沿高出前一根实体下沿 > 1% 股价（也就是重合超过 1%）。
-    磨底阶段的K线都贴在前一根实体下沿附近，一旦有根K线明显往上顶，就是反转开始。
-    找不到（磨底到昨天都没往上顶过）返回 None。
+    "反转那根"：第一根【实体重合超过 1%】且【没有创新低】的K线。
+    磨底阶段的K线都贴在前一根实体下沿附近，一旦有根K线明显往上顶、又没跌破前面已经走过的低点，
+    就是止跌反转开始 → 前低的窗口就截到它为止。
+    创新低（收盘低于 L 到前一根的最低收盘）说明下跌还没走完，不算反转，跳过继续往后找。
+    找不到返回 None。
     """
     if n is None:
         n = len(c)
     for t in range(L_idx + 1, n):
-        if not overlap_ok(o, c, t - 1, t):
+        if not overlap_ok(o, c, t - 1, t) and not makes_new_low(c, L_idx, t):
             return t
     return None
 
@@ -371,18 +392,21 @@ def detect_setup(o, c, h, l, v):
         return None
 
     L = float(o[Li])
+    # 结构还在不在：①站上过 L（本轮已经触发过）②出现"重合超 1% 且创新低"的K线（下跌还没结束，
+    # 那根是新的下跌结构的开始，从它重新数三根急跌；在这之前旧 L 一律不算）
+    for t in range(Li + 1, n):
+        if c[t] > L:
+            return None
+        if (not overlap_ok(o, c, t - 1, t)) and makes_new_low(c, Li, t):
+            return None
+
     # 前低（止损位）：默认取 L 到昨天的最低收盘价；
-    # 一旦出现"开始反转"的那根K线（实体重合超过 1%），前低冻结为 L 到那根之间的最低收盘价，
+    # 一旦出现"反转那根"（重合超 1% 且没创新低），前低冻结为 L 到那根之间的最低收盘价，
     # 之后磨底/回踩的更低收盘价不再下移止损位（否则反转之后随便一个小坑都会把止损拉低、把盈亏比算差）。
     p_low = float(np.min(c[Li:]))
     rev = find_reversal_idx(o, c, Li, n)
     if rev is not None:
         p_low = float(np.min(c[Li:rev + 1]))
-
-    # 窗口内此前已经站上过 L → 结构已经触发过，今天不再买
-    for t in range(Li + 1, n):
-        if c[t] > L:
-            return None
 
     wlen = window_size(o, c, Li, n)
     wleft = Li + wlen - n                  # 今天(索引 n)是第几根：>=0 表示还在窗口内
@@ -488,7 +512,7 @@ def released_mask(h):
 
 def find_recent_swing_high(h, back=HIGH_BACK):
     """
-    "最近一次下跌的起点"（前高）：从右往左，第一个【不低于前一根、且此后没被越过】的高点
+    "最近一次下跌的起点"（前高）：find_all_swing_highs() 里最靠右的那个
     —— 也就是最后一次由涨转跌的那根K线（它后面必须真的还有K线，才谈得上"起点"）。
     用来定位"前高那几根K线"。
     找不到（例如整段单边下跌）就退化成窗口内的最高价那根。
@@ -504,6 +528,30 @@ def find_recent_swing_high(h, back=HIGH_BACK):
         if H[i] >= H[i - 1] and H[i] >= after[i]:
             return s + i
     return s + int(np.argmax(H))
+
+
+def find_all_swing_highs(h, back=HIGH_BACK):
+    """
+    "每一段下跌的起点"（所有由涨转跌的顶）：窗口内满足
+        high[i] >= high[i-1]   且   high[i] >= 它之后所有 high 的最大值
+    的全部下标（升序）。也就是【每一个后面再没被超过的峰】。
+
+    这就是"上涨转成下跌"的判据：一根K线的最高价不低于左邻、也不低于右边任何
+    一根的最高价 —— 说明它是这段行情的局部顶，后面再没涨回去过。
+    一个都找不到（例如整段单边下跌）时退化成窗口内最高价那根。
+    """
+    n = len(h)
+    if n == 0:
+        return []
+    s = max(0, n - back)
+    H = np.asarray(h[s:], dtype=float)
+    after = _suffix_max_after(H)
+    # 首根（左边没K线）和最后一根（后面没K线）都不算"下跌的起点"
+    out = [s + i for i in range(1, len(H) - 1)
+           if H[i] >= H[i - 1] and H[i] >= after[i]]
+    if not out:
+        out = [s + int(np.argmax(H))]
+    return out
 
 
 def find_strong_zones(h, l, v, v0, back=HIGH_BACK, touch=3, vol_cap=VOL_CAP,
@@ -523,8 +571,8 @@ def find_strong_zones(h, l, v, v0, back=HIGH_BACK, touch=3, vol_cap=VOL_CAP,
          → 重合段就是强压力区；价格用整根K线（实体+上下影线都算）
          放量 = 该根成交量 > v0
       3) 任意一根成交量 ≥ vol_cap × v0 → 这一根整根算强压力区
-      4) 前高（最近一次下跌的起点）左边 keep_prev_high(3) 根K线，整根【无条件】算压力区
-         —— 上涨能释放下面的压力，但顶部这几根始终是供给，必须留着
+      4) 每段下跌的起点（每一个"后面再没被超过的峰"）左边 keep_prev_high(3) 根K线，
+         整根【无条件】算压力区 —— 上涨能释放下面的压力，但每个顶部这几根始终是供给，必须留着
     """
     n = len(h)
     if n < 5:
@@ -583,10 +631,10 @@ def find_strong_zones(h, l, v, v0, back=HIGH_BACK, touch=3, vol_cap=VOL_CAP,
             for i in np.where(big)[0]:
                 zones.append((float(Lk[i]), float(Hk[i])))
 
-    # ---------- 4. 前高左边那几根：无条件保留 ----------
-    p = find_recent_swing_high(h, back)
-    for t in range(max(0, p - int(keep_prev_high)), p):
-        zones.append((float(l[t]), float(h[t])))
+    # ---------- 4. 每个下跌起点（峰）左边那几根：无条件保留 ----------
+    for p in find_all_swing_highs(h, back):
+        for t in range(max(0, p - int(keep_prev_high)), p):
+            zones.append((float(l[t]), float(h[t])))
 
     return _merge_zones(zones)
 
@@ -630,7 +678,7 @@ def fallback_target(buy, p_low, high_back_max, rr_min=RR_MIN):
 
     做法：
       1. 先按"固定 rr_min:1"算出目标价：target = buy + rr_min × (buy - p_low)
-      2. 再看这段空间是不是在历史最高价（默认最近 250 根的最高价）之内：
+      2. 再看这段空间是不是在历史最高价（默认最近 120 根的最高价）之内：
          target ≤ high_back_max  → 有这么多空间，就用这个目标（就按 rr_min:1 止盈）
          target >  high_back_max → 上方连 rr_min 倍的空间都没有 → 不做（返回 None）
 
@@ -670,20 +718,6 @@ def stand_gain_ok(price, prev_close, need=STAND_GAIN_PCT):
 def sell_allowed(buy_date, today):
     """A 股 T+1：买入当天不能卖。"""
     return buy_date is not None and buy_date < today
-
-
-def tp_sell_shares(total_amount, ratio=TP_RATIO, lot=TP_LOT):
-    """
-    到压力区要卖多少股（默认 2/3 持仓），向下取整到整手。
-    "不够就全卖"：卖完剩下的不足 1 手（或 2/3 凑不满 1 手）时，返回全部持仓。
-    """
-    total = int(total_amount)
-    if total <= 0:
-        return 0
-    sh = int(np.floor(total * float(ratio) / lot + 1e-9)) * lot
-    if sh <= 0 or total - sh < lot:
-        return total
-    return int(sh)
 
 
 def ma_band(ma20, tol=None):
@@ -759,7 +793,8 @@ def sell_decision(price, entry, today, buy_date, ma20=None,
     返回 (action, 原因)，action ∈ {'', 'all', 'part'}：
       ''    不动
       'all' 全部卖出
-      'part' 只卖 TP_RATIO（2/3），剩下 1/3 继续持有、跟 20 日线
+      'part' 卖到只剩【最初仓位的 1/3】（不是卖剩余 2/3）：具体股数由调用方的
+             `tp_part_shares()` 按 qty0 - sold 算，剩下 1/3 继续持有、跟 20 日线
 
     规则（优先级从上到下）：
       1) T+1 没到 → 不动
@@ -768,9 +803,9 @@ def sell_decision(price, entry, today, buy_date, ma20=None,
       4) 到压力区（按 target_hit() 判，含跳空处理）：
            - 开盘就跳空到目标价之上 → 不卖，等盘中回落到目标价再卖
            - 开盘在目标价之下 → 盘中最高价到目标价就卖
-           - 价格在 MA20×(1-1%) 上方 → 卖 2/3，留 1/3
-           - 到压力区时还没过 MA20（价 < MA20×(1-1%)）→ 全卖（反弹太弱，不留）
-           - 拿不到 MA20 → 全卖（不硬扛）
+           - 卖多少只看最初仓位：累计卖到 2/3 初始（tp_part_shares() 会抵扣已减的部分）
+           - 站上 MA20（价 ≥ MA20×0.99）才留 1/3 尾巴；已跌破 → 当天全卖，不留过夜
+           - 拿不到 MA20 数据时才全卖
       5) 时间止损（MAX_HOLD_DAYS，默认关闭）→ 全卖
 
     day_open / day_high / day_low = 当日开盘价、截至 14:55 的最高价、最低价；
@@ -804,9 +839,13 @@ def sell_decision(price, entry, today, buy_date, ma20=None,
             return 'all', '止盈:到压力区' + tail
         if band is None:
             return 'all', '止盈:到压力区(无20日线,全卖)' + tail
-        if price > band:
-            return 'part', '止盈:到压力区(站在20日线上,先卖2/3)' + tail
-        return 'all', '止盈:到压力区(未过20日线,全卖)' + tail
+        # 到目标价时已经跌破 20 日线（没站上）→ 当天就全卖，
+        # 不留 1/3 过夜（否则次日 14:55 照样要清，白担一夜风险）。
+        if price < band:
+            return 'all', '止盈:到压力区(未站上MA20,全卖)' + tail
+        # 站上 20 日线：只卖到【2/3 最初仓位】，留 1/3 尾巴跟 20 日线；
+        # 之前因放量减仓已经卖掉的份额算在这 2/3 里（`tp_part_shares()` 会抵扣）。
+        return 'part', '止盈:到压力区(卖到剩1/3,留尾巴)' + tail
 
     if MAX_HOLD_DAYS and (today - buy_date).days >= MAX_HOLD_DAYS:
         return 'all', '时间止损'
@@ -839,22 +878,50 @@ def vol_exceed(vol_today, v10, cap=REDUCE_VOL_CAP):
     return bool(vt > cap * v10)
 
 
-def reduce_shares(total_amount, ratio=REDUCE_RATIO, lot=REDUCE_LOT):
+def reduce_shares(total_amount, init_amount=None,
+                  ratio=REDUCE_RATIO, lot=REDUCE_LOT):
     """
-    "卖出 1/3 持仓"要卖多少股：向下取整到 100 股整手。
-    持仓不足 2 手时返回 0（不拆，留给止盈/止损一次清掉）。
-    剩余股数永远 > 0，不会把仓位误清空。
+    放量减仓要卖多少股。份额按【最初仓位】算，不按剩余仓位（`init_amount` = 买入时的股数）。
+
+      - 剩余 ≥ 2 手：卖 ratio（默认 1/3）× 最初仓位，向下取整到 1 手
+      - 剩余 < 2 手，或 1/3 最初仓位不足 1 手 / 不小于剩余：直接卖【剩余的一半】
+      - 卖完之后剩下的不足 1 手（碎股）→ 这一次直接把它一起卖掉，即清仓
+
+    "剩余 200 股"的完整走法：第一次触发卖一半 100（剩 100 股，正好 1 手）；
+    再触发时 100 的一半是 50，剩 50 不足 1 手 → 直接全卖 100。
+    init_amount 不传就当作等于当前剩余（旧口径）。
     """
     total = int(total_amount)
-    if total < 2 * lot:
+    init = int(init_amount) if init_amount else total
+    if total <= 1 or init <= 0:
         return 0
     # +1e-9 是为了避免 300*(1/3)=99.99999 被截成 0 手这种浮点误差
-    sh = int(np.floor(total * float(ratio) / lot + 1e-9)) * lot
-    if sh <= 0:
-        sh = lot
-    if sh >= total:
-        sh = total - lot
-    return int(sh)
+    third = int(np.floor(init * float(ratio) / lot + 1e-9)) * lot
+    if total < 2 * lot or third < lot or third >= total:
+        sh = int(total // 2)
+    else:
+        sh = third
+    # 剩下的不足 1 手（碎股再触发也拆不动）→ 这次一起卖掉
+    if total - sh < lot:
+        return int(total)
+    return int(max(sh, 0))
+
+
+def tp_part_shares(init_amount, sold_amount, remain_amount,
+                   ratio=TP_RATIO, lot=REDUCE_LOT):
+    """
+    到目标价时"卖到只剩 1/3 最初仓位"：先算总共该卖 ratio×最初仓位（向下取整到 1 手），
+    再减掉之前已经因放量减仓卖掉的股数（`sold_amount`），就是要再卖的股数。
+    已经卖够了返回 0（此时只标记 tp2_done，让剩下的尾巴跟 20 日线）。
+    """
+    init = int(init_amount)
+    remain = int(remain_amount)
+    if init <= 0 or remain <= 1:
+        return 0
+    total_tp = int(np.floor(init * float(ratio) / lot + 1e-9)) * lot
+    sh = total_tp - int(sold_amount)
+    sh = min(sh, remain - 1)
+    return int(max(sh, 0))
 
 
 # =============================================================================
@@ -986,12 +1053,12 @@ def trade_1455(context):
             target = pick_target(zones, p)
             src = '压力区'
         else:
-            # 上方一条压力区都没有 → 用"250 日最高价"兜底：空间够 2:1 就按 2:1 止盈
+            # 上方一条压力区都没有 → 用"120 日最高价"兜底：空间够 2:1 就按 2:1 止盈
             if not USE_HIGH_FALLBACK:
                 continue
             high_max = float(np.max(h[-HIGH_BACK:])) if len(h) else None
             target = fallback_target(p, st['p_low'], high_max)
-            src = '250日高点'
+            src = '120日高点'
             if target is None:
                 continue
         if target is None:
@@ -1325,6 +1392,19 @@ def _hist_vol_ma(code, n=VOL_L):
         return None
 
 
+def _prev_close(code):
+    """持仓股的昨收价（用于"当天涨幅 > 5%"判定）。取不到返回 None。"""
+    try:
+        h = attribute_history(code, 1, '1d', ['close'], skip_paused=True, df=False)
+        arr = np.asarray(h['close'], dtype=float)
+        arr = arr[np.isfinite(arr) & (arr > 0)]
+        if len(arr) == 0:
+            return None
+        return float(arr[-1])
+    except Exception:
+        return None
+
+
 def _hist_close_ma(code, n=MA20_N, price_today=None):
     """
     持仓股的 n 日收盘均线——用于"跌破20日线"。
@@ -1415,23 +1495,27 @@ def _exec_sell(s, context, p, act, why, ma20, entry, ret):
         g.buy_date.pop(s, None)
         return True
 
-    # ---------- 到压力区：卖 2/3，留 1/3 ----------
+    # ---------- 到压力区：卖到只剩 1/3 最初仓位，留 1/3 尾巴 ----------
     if act == 'part':
-        sh = tp_sell_shares(pos.total_amount)
-        if sh <= 0 or sh >= pos.total_amount:
-            order_target(s, 0)
-            g.stat['sell_win' if ret > 0 else 'sell_lose'] += 1
-            log.info('清仓(不够拆) %s @%.2f %s 收益%.2f%%' % (s, p, why, ret))
-            g.entry.pop(s, None)
-            g.buy_date.pop(s, None)
-        else:
-            order_target(s, int(pos.total_amount - sh))
+        qty0 = entry.get('qty0') or int(pos.total_amount)
+        sold = int(entry.get('sold') or 0)
+        sh = tp_part_shares(qty0, sold, pos.total_amount)
+        if sh <= 0:
+            # 之前放量减仓已经卖够了 2/3 → 到目标价不再卖，只把尾巴转成跟 20 日线
             entry['tp2_done'] = True
             entry['tp2_price'] = float(p)
             g.stat['tp_part'] += 1
-            log.info('止盈减仓 %s @%.2f %s 卖%d股 留%d股跟MA%d(%.2f) 收益%.2f%%'
-                     % (s, p, why, sh, int(pos.total_amount - sh),
-                        MA20_N, ma20, ret))
+            log.info('到目标价 %s @%.2f %s 已卖够2/3，剩%d股继续跟MA%d(%.2f) 收益%.2f%%'
+                     % (s, p, why, int(pos.total_amount), MA20_N, ma20, ret))
+            return True
+        order_target(s, int(pos.total_amount - sh))
+        entry['sold'] = sold + sh
+        entry['tp2_done'] = True
+        entry['tp2_price'] = float(p)
+        g.stat['tp_part'] += 1
+        log.info('止盈减仓 %s @%.2f %s 卖%d股(累计卖%d/最初%d) 留%d股跟MA%d(%.2f) 收益%.2f%%'
+                 % (s, p, why, sh, entry['sold'], qty0,
+                    int(pos.total_amount - sh), MA20_N, ma20, ret))
         return True
 
     return False
@@ -1441,10 +1525,10 @@ def _do_sell(context, today, price=None, vol_today=None):
     """
     卖出，14:55 执行，优先级：
       1) 跌破前低 / 时间止损                → 全部清仓
-      2) 到压力区 → 站上20日线：卖 2/3，留 1/3 跟 20 日线
-                   → 没过20日线：全部清仓
+      2) 到压力区 → 卖到只剩【最初仓位的 1/3】（与 20 日线无关），留 1/3 跟 20 日线
       3) 已经卖过 2/3 的 1/3 尾巴 → 跌破 20 日线清仓
-      4) 当日成交量 > 2×MA10(量)           → 卖出 1/3 持仓（放量减仓，止盈前才做）
+      4) 当日成交量 > 2×MA10(量) → 减仓【最初仓位】的 1/3（剩余不足 2 手时卖一半，
+         卖完剩下的不足 1 手就一起清掉）；再次触发要有台阶：≥1.05×上次减仓价 或 当天涨>5%
     1)~3) 成立时不会再执行 4)。
 
     "到压力区"的判定会带上当日开盘价和盘中最高/最低价（`_today_range()`）：
@@ -1487,20 +1571,41 @@ def _do_sell(context, today, price=None, vol_today=None):
             _exec_sell(s, context, p, act, why, ma20, entry, ret)
             continue
 
-        # ---------- 放量减仓：当日量 > 2 × MA10(量) → 卖 1/3 ----------
+        # ---------- 放量减仓：当日量 > 2 × MA10(量) → 卖 1/3【最初仓位】 ----------
         if not sell_allowed(buy_date, today):
             continue
         vt = vol_today.get(s)
         v10 = _hist_vol_ma(s)
         if not vol_exceed(vt, v10):
             continue
-        sh = reduce_shares(pos.total_amount)
+        # 再次触发要有台阶：股价 ≥ 1.05×上次减仓价，或当天相对昨收涨幅 > 5%
+        anchor = entry.get('vol_anchor')
+        if anchor is not None:
+            up_5 = p >= float(anchor) * REDUCE_REARM_GAIN
+            pct = None
+            pc = _prev_close(s)
+            if pc:
+                pct = float(p) / float(pc) - 1.0
+            big_day = pct is not None and pct > REDUCE_REARM_DAY_PCT
+            if not (up_5 or big_day):
+                continue
+        qty0 = entry.get('qty0') or int(pos.total_amount)
+        sh = reduce_shares(pos.total_amount, qty0)
         if sh <= 0:
             continue
-        order_target(s, int(pos.total_amount - sh))
+        left = int(pos.total_amount - sh)
+        order_target(s, left)
+        entry['sold'] = int(entry.get('sold') or 0) + sh
+        entry['vol_anchor'] = float(p)
         g.stat['reduce'] += 1
-        log.info('减仓 %s @%.2f 卖%d股(1/3持仓) 当日量%.0f > %.1f×MA%d(%.0f)'
-                 % (s, p, sh, vt, REDUCE_VOL_CAP, VOL_L, v10))
+        log.info('减仓 %s @%.2f 卖%d股(%d/%d)%s 当日量%.0f > %.1f×MA%d(%.0f) 剩余%d股'
+                 % (s, p, sh, entry['sold'], qty0,
+                    '(清掉碎股)' if left <= 0 else '',
+                    vt, REDUCE_VOL_CAP, VOL_L, v10, left))
+        if left <= 0:
+            g.stat['sell_win' if p > entry['buy'] else 'sell_lose'] += 1
+            g.entry.pop(s, None)
+            g.buy_date.pop(s, None)
 
 
 def _do_buy(context, today, picks):
@@ -1545,6 +1650,9 @@ def _do_buy(context, today, picks):
         g.entry[code] = {
             'L': st['L'], 'p_low': st['p_low'], 'target': target,
             'buy': float(cost), 'rr': rr, 'L_idx': st['L_idx'], 'buy_date': today,
+            'qty0': int(amt),        # 最初股数：减仓/止盈的份额都按它算
+            'sold': 0,               # 累计已卖出股数
+            'vol_anchor': None,      # 上次放量减仓的价格（再次减仓要 ≥ 它的 1.05 倍）
         }
         g.buy_date[code] = today
         g.stat['buy'] += 1
@@ -1578,14 +1686,16 @@ def _do_buy(context, today, picks):
 # 连续三根k线在1%以内算放缓                  slow_run_ok()：窗口放宽到 6 根
 # 放缓的3根也不能重合超过1%（否则是反转）    slow_run_ok() 里再过 overlap_ok()，NARROW_OVERLAP 开关
 # 同时不可以创新低                          no_new_low()：price >= p_low
-# 反转那根出现后前低冻结                    find_reversal_idx()：p_low 只取 L 到反转那根
+# 反转那根出现后前低冻结                    find_reversal_idx()：重合>1% 且不创新低，p_low 只取 L 到那根
+# 重合>1% 又创新低 → 新的下跌结构            detect_setup()：直接作废，重新数三根急跌（makes_new_low）
 # 价格到达压力区就卖出                       target_hit() 判到价；sell_decision() 决定卖多少
 # 持仓期高开在目标价之上 → 不卖等回落          target_hit()：开盘>目标 且 当日最低>目标 → 不卖（GAP_UP_HOLD）
 # 到目标价止盈改到盘中执行              handle_data()：每分钟判 到价 → 当场卖（GAP_WATCH_SELL）
 # 止损/放量减仓只在 14:55                 handle_data() 遇到"现价≤前低"直接跳过，交给 _do_sell
-# 到压力区卖2/3（站上20日线）/ 全卖（没过）    sell_decision() 的 'part' / 'all' 分支
+# 到压力区 → 站上MA20卖到剩1/3初始            sell_decision()：价≥MA20×0.99 返回 'part'；tp_part_shares() 抵扣已减的份额
+# 到压力区 → 已跌破MA20则当天全卖             sell_decision()：价<MA20×0.99 返回 'all'（尾巴跟不住均线，不留过夜）
 # 剩下1/3跌破20日均线再卖                    sell_decision()：tp2_done + price < ma_band()（MA20×0.99）
-# 不够拆就全卖                              tp_sell_shares()：剩不足1手 或 2/3不足1手 → 全卖
+# 算不够1手 / 拿不到20日线 → 全卖             tp_part_shares() 返回不足1手时兜底 'all'
 # 不能买：两倍十日成交量的K线                volume_ok()：VOL 必须 < 2×MA10(VOL)
 # 必须放量过5日均量（10%容差）              volume_ok()：VOL > MA5×(1-VOL_S_TOL)
 # 20日均线跌破容差1%                        ma_band(ma20, MA20_TOL)，含当天 MA20_INCLUDE_TODAY=True
@@ -1594,10 +1704,11 @@ def _do_buy(context, today, picks):
 # 影线也算，实体也算                        find_strong_zones() 用 [low, high]，不只看收盘价
 # 最高价到昨天这一整段下跌阶段都算            find_strong_zones() 窗口 = [find_peak_idx(), 昨天]
 # 只有下降波段才有压力，涨回去就释放          released_mask()：后面最高价≥本根最高价（整根覆盖）→ 释放
-# 前高（最近一次下跌的起点）那几根            find_recent_swing_high() + ZONE_KEEP_PREV_HIGH=3（无条件保留）
+# 每个下跌起点的左边那几根                    find_all_swing_highs() + ZONE_KEEP_PREV_HIGH=3（无条件保留）
 # 压力区很近 → 目标取最近的那个              pick_target()：上方最近压力区的下沿；已在区内则不买
-# 上方没压力区 → 按 250 日高点空间兜底         fallback_target()：target = 买入+2×(买入-前低)，须 ≤ 250 日最高价
+# 上方没压力区 → 按 120 日高点空间兜底         fallback_target()：target = 买入+2×(买入-前低)，须 ≤ 120 日最高价
 # 成交量 > 买入当天那根K线的成交量           find_strong_zones(v0=买入当天量)
-# 买入后遇当日量 > 2×MA10 → 卖 1/3 持仓      _do_sell()：vol_exceed() + reduce_shares()
+# 买入后遇当日量 > 2×MA10 → 减仓1/3初始      _do_sell()：vol_exceed() + reduce_shares(最初仓位)；剩余不足2手卖一半，卖完剩不足1手清仓
+# 再减要涨回1.05倍或当天涨5%                 _do_sell()：vol_anchor×REDUCE_REARM_GAIN / _prev_close()
 #
 # =============================================================================

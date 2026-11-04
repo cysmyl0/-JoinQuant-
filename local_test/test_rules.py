@@ -204,6 +204,42 @@ def run():
           'p_low=%s rev=%s' % (None if st is None else st['p_low'],
                                S.find_reversal_idx(o, c, L_IDX)))
 
+    print('\n[10d] 重合超1%又创新低 → 不是反转，是新的下跌结构')
+    # 收盘 -0.83%（在 ±1% 内，本来算窄幅），但实体上沿 24.80 压过前一根 2.93%，且收 23.90 破前低
+    rows10d = BASE + [bar(24.20, 24.20),
+                      bar(24.15, 24.10),
+                      bar(24.80, 23.90)]
+    o, c, h, l, v = mk(rows10d)
+    check('10d 重合超1%且创新低 → 结构作废（重新数三根急跌）',
+          S.detect_setup(o, c, h, l, v) is None
+          and S.makes_new_low(c, L_IDX, 36) is True
+          and S.find_reversal_idx(o, c, L_IDX) is None,
+          'rev=%s newlow=%s' % (S.find_reversal_idx(o, c, L_IDX),
+                                S.makes_new_low(c, L_IDX, 36)))
+    # 同样一根创新低，但如果重合没超 1%（跳空低开小实体）→ 不算新的推动，结构仍有效
+    rows10e = BASE + [bar(24.20, 24.20),
+                      bar(24.15, 24.10),
+                      bar(23.95, 23.90)]
+    o, c, h, l, v = mk(rows10e)
+    st = S.detect_setup(o, c, h, l, v)
+    check('10e 创新低但重合≤1% → 结构不废（只是前低更低）',
+          st is not None and abs(st['p_low'] - 23.90) < 1e-9,
+          'p_low=%s' % (None if st is None else st['p_low']))
+
+    # 跳空低开、跌幅 >1% 的那根本身就是有效大阴线 → 它自己会变成新的 L，轮不到"放过"
+    rows10f = BASE + [bar(24.20, 24.20),
+                      bar(24.15, 24.10),
+                      bar(23.60, 23.30)]
+    o, c, h, l, v = mk(rows10f)
+    check('10f 跳空低开且跌幅>1% → 它自己就是新 L（find_L 直接选它）',
+          S.is_valid_bear(o, c, 36)
+          and S.find_L(o, c) == 36
+          and abs(o[S.find_L(o, c)] - 23.60) < 1e-9,
+          'find_L=%s L=%.2f 跌幅%.2f%% 重合%.2f%%'
+          % (S.find_L(o, c), o[S.find_L(o, c)],
+             (o[36] - c[36]) / c[36] * 100,
+             S.body_overlap(o, c, 35, 36) / c[36] * 100))
+
     print('\n[11] 急跌判定')
     o, c, h, l, v = mk(BASE)
     check('11a 连跌4根累计-14% → True', S.is_sharp_decline(o, c, L_IDX) is True)
@@ -245,18 +281,18 @@ def run():
           S.zone_status([(18.0, 19.0), (20.0, 21.0)], 25.0) == 'none')
     check('14i 一条压力区都没算出来 → none', S.zone_status([], 25.0) == 'none')
 
-    # 14j 上方没压力区时的兜底：按固定 2:1 算目标，但必须落在 250 日最高价之内
-    check('14j 250日高点有空间 → 目标 = 买入 + 2×(买入-前低) = 30.0',
+    # 14j 上方没压力区时的兜底：按固定 2:1 算目标，但必须落在 120 日最高价之内
+    check('14j 120日高点有空间 → 目标 = 买入 + 2×(买入-前低) = 30.0',
           abs(S.fallback_target(25.0, 22.5, 40.0) - 30.0) < 1e-9)
     check('14j 250日最高价正好等于目标 → 边界通过',
           abs(S.fallback_target(25.0, 22.5, 30.0) - 30.0) < 1e-9)
     check('14j 250日最高价不够 2:1（29.0 < 30.0）→ 不买',
           S.fallback_target(25.0, 22.5, 29.0) is None)
-    check('14j 买入价已在 250 日最高价上 → 没有空间，不买',
+    check('14j 买入价已在 120 日最高价上 → 没有空间，不买',
           S.fallback_target(25.0, 24.0, 25.0) is None)
     check('14j 前低 ≥ 买入价（没有风险度）→ 不买',
           S.fallback_target(25.0, 25.0, 40.0) is None)
-    check('14j 没给 250 日最高价 → 不买',
+    check('14j 没给 120 日最高价 → 不买',
           S.fallback_target(25.0, 22.5, None) is None)
 
     # 14k 到价判定：持仓期跳空（开盘价已在目标价之上）怎么处理
@@ -397,15 +433,34 @@ def run():
     sw = S.find_recent_swing_high(h)
     check('15i 前高 = 回升到 15 的那根（不是 30 那根）',
           abs(h[sw] - 15.05) < 1e-9, 'idx=%d high=%.2f' % (sw, h[sw]))
-    zones = S.find_strong_zones(h, l, v, v0=V0)         # 默认保留前高 3 根
-    check('15i 前高左边 3 根 → 12/13/14 三小段',
-          len(zones) == 3
+    zones = S.find_strong_zones(h, l, v, v0=V0)         # 默认保留每个峰左 3 根
+    check('15i 每个下跌起点的左边 3 根都保留 → 12/13/14 + 27（28 那根下跌起点）',
+          len(zones) == 4
           and abs(zones[0][0] - 11.95) < 1e-9
           and abs(zones[1][0] - 12.95) < 1e-9
-          and abs(zones[2][0] - 13.95) < 1e-9, 'zones=%s' % zones)
+          and abs(zones[2][0] - 13.95) < 1e-9
+          and abs(zones[3][0] - 26.95) < 1e-9, 'zones=%s' % zones)
     check('15i 关掉前高 3 根 → 无压力区（全是缩量）',
           S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH) == [],
           'zones=%s' % S.find_strong_zones(h, l, v, v0=V0, keep_prev_high=NO_PH))
+
+    # 15i2 两个峰（29→30 →跌到22 → 反弹26.5 → 跌回23.8）：两段下跌的起点都要保留左 3 根
+    hh = np.array([29.0, 29.4, 29.8, 30.0, 29.0, 28.0, 27.0, 26.0, 25.0, 24.0,
+                   23.0, 22.0, 22.5, 23.0, 23.5, 24.0, 24.5, 25.0, 25.5, 26.0,
+                   26.5, 26.0, 25.0, 24.0, 23.8], float)
+    ll = hh - 0.20
+    vv = np.full(len(hh), 1000.0)
+    sw = S.find_all_swing_highs(hh)
+    check('15i2 两个峰都识别成下跌起点（30 与 26.5）',
+          len(sw) == 2 and abs(hh[sw[0]] - 30.0) < 1e-9
+          and abs(hh[sw[1]] - 26.5) < 1e-9, 'idx=%s' % sw)
+    check('15i2 find_recent_swing_high 仍取最后一个峰',
+          S.find_recent_swing_high(hh) == sw[-1],
+          'idx=%d' % S.find_recent_swing_high(hh))
+    z2 = S.find_strong_zones(hh, ll, vv, v0=1000.0)
+    check('15i2 两段下跌的各 3 根都进压力区（28.8~29.8 与 24.8~26.0）',
+          any(abs(lo - 28.80) < 1e-9 for lo, hi in z2)
+          and any(abs(hi - 26.00) < 1e-9 for lo, hi in z2), 'zones=%s' % z2)
 
     # 15j released_mask 单元测试：后面的最高价 ≥ 本根最高价 → 释放
     m = S.released_mask([10.0, 11.0, 9.0])
@@ -450,10 +505,27 @@ def run():
     check('17e 300股 → 卖100股', S.reduce_shares(300) == 100)
     check('17f 1000股 → 卖300股', S.reduce_shares(1000) == 300)
     check('17g 1200股 → 卖400股', S.reduce_shares(1200) == 400)
-    check('17h 200股 → 至少卖1手', S.reduce_shares(200) == 100)
-    check('17i 150股（不足2手）→ 不减', S.reduce_shares(150) == 0)
+    check('17h 200股（1/3不足1手）→ 卖一半 100股', S.reduce_shares(200) == 100)
+    check('17i 150股（卖一半后剩75股不足1手）→ 全卖 150股', S.reduce_shares(150) == 150)
+    check('17i2 200股第一次卖100，剩100股再触发 → 全卖100股',
+          S.reduce_shares(200) == 100 and S.reduce_shares(100) == 100)
+    check('17i3 100股（只有1手）→ 一次全卖 100股', S.reduce_shares(100) == 100)
     check('17j 300股减完还剩200股（不会清仓）',
           S.reduce_shares(300) < 300 and 300 - S.reduce_shares(300) > 0)
+    # 份额按【最初仓位】算，不按剩余：最初 1200，剩 600 → 卖 400（不是 200）
+    check('17k 最初1200/剩600 → 卖400（按最初仓位）',
+          S.reduce_shares(600, 1200) == 400)
+    # 1/3 最初仓位 ≥ 剩余 → 改卖一半；剩的还有 1 手就留着
+    check('17l 最初1200/剩300 → 卖150（剩150仍≥1手）',
+          S.reduce_shares(300, 1200) == 150
+          and 300 - S.reduce_shares(300, 1200) >= 100)
+    # 到目标价：卖到只剩 1/3 最初仓位，已卖部分抵扣
+    check('17m 最初1000/已减300 → 再卖300（累计600，留400）',
+          S.tp_part_shares(1000, 300, 700) == 300)
+    check('17n 最初1000/没减过 → 卖600（留400）',
+          S.tp_part_shares(1000, 0, 1000) == 600)
+    check('17o 最初1000/已减600 → 已够2/3，不再卖',
+          S.tp_part_shares(1000, 600, 400) == 0)
 
     print('\n[18] 急跌三条口径（可开关）')
     g0, f0 = S.REQUIRE_GAP, S.REQUIRE_FIRST_DROP
@@ -555,13 +627,15 @@ def run():
     finally:
         S.EXCLUDE_ST = e0
 
-    print('\n[21] 止盈：到压力区卖 2/3，剩下 1/3 跟 20 日线')
-    check('21a 1000股 → 卖600', S.tp_sell_shares(1000) == 600)
-    check('21b 500股 → 卖300（取整手）', S.tp_sell_shares(500) == 300)
-    check('21c 300股 → 卖200', S.tp_sell_shares(300) == 200)
-    check('21d 200股 → 卖100（剩1手）', S.tp_sell_shares(200) == 100)
-    check('21e 100股 → 不够拆，全卖', S.tp_sell_shares(100) == 100)
-    check('21f 0股 → 0', S.tp_sell_shares(0) == 0)
+    print('\n[21] 止盈：到压力区卖到剩 1/3 最初仓位，剩下 1/3 跟 20 日线')
+    check('21a 1000股 没减过仓 → 卖600', S.tp_part_shares(1000, 0, 1000) == 600)
+    check('21b 1000股 已减300 → 只补300', S.tp_part_shares(1000, 300, 700) == 300)
+    check('21c 1000股 已卖够600 → 不再卖', S.tp_part_shares(1000, 600, 400) == 0)
+    check('21d 700股 已减300 → 补到600，卖300',
+          S.tp_part_shares(1000, 300, 700) == 300)
+    check('21e 300股 没减过 → 卖200（留1手）', S.tp_part_shares(300, 0, 300) == 200)
+    check('21f 0股 → 0', S.tp_part_shares(0, 0, 0) == 0)
+    check('21f2 500股 没减过 → 卖300（取整手）', S.tp_part_shares(500, 0, 500) == 300)
 
     ent = {'p_low': 24.0, 'target': 27.95, 'buy': 25.0}
     d0 = datetime.date(2024, 6, 3)
@@ -570,8 +644,11 @@ def run():
           S.sell_decision(27.95, dict(ent), d0, bd, ma20=26.98)[0] == 'part')
     check('21h 到压力区但价 == 20日线 → 还在容差内 → 仍卖 2/3',
           S.sell_decision(27.95, dict(ent), d0, bd, ma20=27.95)[0] == 'part')
-    check('21i 到压力区但价格在20日线下方 → 全卖',
+    check('21i 到压力区但已跌破20日线×0.99（没站上）→ 当天全卖，不留尾巴',
           S.sell_decision(27.95, dict(ent), d0, bd, ma20=28.50)[0] == 'all')
+    check('21i2 刚好压在容差线上（既不高于也不低于）→ 仍卖 2/3',
+          S.sell_decision(27.95, dict(ent), d0, bd,
+                          ma20=27.95 / 0.99)[0] == 'part')
     check('21j 到压力区但拿不到20日线 → 全卖',
           S.sell_decision(27.95, dict(ent), d0, bd, ma20=None)[0] == 'all')
     check('21k 卖过2/3后 跌破20日线 → 清掉剩下的1/3',
@@ -599,7 +676,7 @@ def run():
           S.sell_decision(26.70, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == 'all')
     check('22d 到压力区时价 27.95 在均线 28.00 下方但只差 0.18% → 仍卖 2/3',
           S.sell_decision(27.95, dict(ent), d0, bd, ma20=28.00)[0] == 'part')
-    check('22e 到压力区时价 27.95 比均线 28.50 低 1.9% → 全卖',
+    check('22e 到压力区时价 27.95 比均线 28.50 低 1.9%（跌破容差线）→ 全卖',
           S.sell_decision(27.95, dict(ent), d0, bd, ma20=28.50)[0] == 'all')
     t0 = S.MA20_TOL
     try:

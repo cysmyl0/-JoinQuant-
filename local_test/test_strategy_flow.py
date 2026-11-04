@@ -277,7 +277,8 @@ def run_hold(now_price, now_vol, shares=1000, target=30.0, p_low=22.50, tp2=Fals
     pf.positions[CODE] = Obj(total_amount=shares, avg_cost=25.0, last=now_price)
     S.g.entry[CODE] = {'L': 24.90, 'p_low': p_low, 'target': target, 'buy': 25.0,
                        'rr': 2.0, 'L_idx': 56,
-                       'buy_date': datetime.date(2024, 5, 30)}
+                       'buy_date': datetime.date(2024, 5, 30),
+                       'qty0': int(shares), 'sold': 0, 'vol_anchor': None}
     if tp2:
         S.g.entry[CODE]['tp2_done'] = True
     S.g.buy_date[CODE] = datetime.date(2024, 5, 30)
@@ -391,10 +392,13 @@ def main():
     check('L1 清空剩余持仓', CODE not in pf2.positions, str(pf2.positions))
     check('L2 卖出记录被移除', CODE not in S.g.entry, str(list(S.g.entry)))
 
-    print('\n[场景 M] 到压力区(26.50) 但价格没过20日线(26.60 < 26.98) → 全卖，不留1/3')
+    print('\n[场景 M] 到压力区(26.50) 但已跌破20日线×0.99(26.60 < 26.71) → 当天全卖')
     ctx, pf = run_hold(now_price=26.60, now_vol=1500.0, shares=1000, target=26.50)
-    check('M1 全部卖出', CODE not in pf.positions, str(pf.positions))
-    check('M2 卖出记录被移除', CODE not in S.g.entry, str(list(S.g.entry)))
+    check('M1 全卖，仓位清零',
+          pf.positions.get(CODE) is None
+          or pf.positions[CODE].total_amount == 0, str(pf.positions))
+    check('M2 卖出记录被移除（没有尾巴要跟了）',
+          CODE not in S.g.entry, str(list(S.g.entry)))
 
     print('\n[场景 N] 卖过 2/3 后价格仍在 20 日线上方(27.50 > 26.98) → 继续持有，不再卖')
     ctx, pf = run_hold(now_price=27.50, now_vol=1500.0, shares=400,
@@ -459,7 +463,7 @@ def main():
         S.get_all_securities = orig_sec
     check('S1 上市 2 年 → 被剔除，池子为空', pool == [], str(pool))
 
-    print('\n[场景 T] 上方找不到压力区 → 用 250 日高点的空间兜底，按固定 2:1 止盈')
+    print('\n[场景 T] 上方找不到压力区 → 用 120 日高点的空间兜底，按固定 2:1 止盈')
     orig_zones = S.find_strong_zones
     S.find_strong_zones = lambda *a, **k: []          # 模拟"一条压力区都没算出来"
     try:
@@ -474,7 +478,7 @@ def main():
     check('T3 盈亏比正好 2:1（浮点容差内）',
           e is not None and abs(e['rr'] - 2.0) < 1e-6, str(e and e['rr']))
 
-    print('\n[场景 U] 上方没压力区，但 250 日高点也够不到 2:1 的目标 → 不买')
+    print('\n[场景 U] 上方没压力区，但 120 日高点也够不到 2:1 的目标 → 不买')
     orig_zones = S.find_strong_zones
     orig_get_price = S.get_price
     cap = 26.50          # 历史上最高价只到 26.50 < 目标 27.60
@@ -497,7 +501,7 @@ def main():
     finally:
         S.get_price = orig_get_price
         S.find_strong_zones = orig_zones
-    check('U1 250 日高点 26.50 < 目标 27.60 → 不买',
+    check('U1 120 日高点 26.50 < 目标 27.60 → 不买',
           len([x for x in ORDERS if x[0] == 'buy']) == 0, str(ORDERS))
 
     print('\n[场景 V] 持仓期高开在目标价(27.95)之上，全天没回落 → 不卖，继续持有')
@@ -599,17 +603,51 @@ def main():
           pf.positions.get(CODE) is not None
           and pf.positions[CODE].total_amount == 1000, str(pf.positions))
 
-    print('\n[场景 Z5] 高开回落到目标价(26.50)，但目标价低于 20 日线 → 盘中全卖')
+    print('\n[场景 Z5] 高开回落到目标价(26.50)，但已跌破 20 日线×0.99 → 盘中直接全卖')
     ctx, pf = run_hold(now_price=27.00, now_vol=1500.0, shares=1000, target=26.50,
                        day_open=27.00, day_high=27.00, day_low=26.90)
     check('Z5a 14:55 没卖',
           len([x for x in ORDERS if x[0] == 'sell']) == 0, str(ORDERS))
     ctx.current_dt = datetime.datetime(2024, 6, 3, 10, 30)
     S.handle_data(ctx, {CODE: Obj(close=26.50)})
-    check('Z5b 盘中触发止盈且全卖（不留 1/3）',
+    check('Z5b 盘中触发止盈 → 全卖，仓位清零',
           len([x for x in ORDERS if x[0] == 'sell']) == 1
           and (pf.positions.get(CODE) is None
                or pf.positions[CODE].total_amount == 0), str(ORDERS))
+
+    print('\n[场景 V6] 爆量减仓的再次触发台阶：涨到 1.05×上次触发价 或 当天涨 5%')
+    orig_pc = S._prev_close
+    S._prev_close = lambda s: 27.00
+    try:
+        ctx, pf = run_hold(now_price=27.50, now_vol=2500.0, shares=1000)
+        check('V6a 第一次爆量 → 按最初仓位卖 300，剩 700',
+              pf.positions[CODE].total_amount == 700
+              and S.g.stat.get('reduce') == 1, str(pf.positions))
+        check('V6b 记住本次触发价 27.50',
+              abs(S.g.entry[CODE]['vol_anchor'] - 27.50) < 1e-9,
+              str(S.g.entry.get(CODE)))
+        pf = rerun(ctx, 27.80, 2500.0)     # 只涨 1.1%，没到 1.05 倍，当天也没涨 5%
+        check('V6c 没涨到 1.05 倍、当天也没涨 5% → 不再减',
+              pf.positions[CODE].total_amount == 700 and S.g.stat.get('reduce') == 1,
+              str(pf.positions))
+        pf = rerun(ctx, 28.90, 2500.0)     # 1.05×27.50 = 28.875，过了台阶
+        check('V6d 涨到 1.05 倍 → 再减 300，剩 400',
+              pf.positions[CODE].total_amount == 400 and S.g.stat.get('reduce') == 2,
+              str(pf.positions))
+        S._prev_close = lambda s: 28.00
+        pf = rerun(ctx, 29.50, 2500.0)     # 距上次只涨 2.1%，但当天涨 5.36%
+        check('V6e 当天涨 5% → 也满足再触发，再减 300，剩 100',
+              pf.positions[CODE].total_amount == 100 and S.g.stat.get('reduce') == 3,
+              str(pf.positions))
+        S._prev_close = lambda s: 30.00
+        S.g.entry[CODE]['target'] = 99.0      # 挪开止盈，单独看"剩 100 股"的减仓
+        pf = rerun(ctx, 32.00, 2500.0)
+        check('V6f 剩 100 股（只有1手，卖一半后剩 50 不足1手）→ 全部卖掉，仓位清零',
+              (CODE not in pf.positions
+               or pf.positions[CODE].total_amount == 0)
+              and S.g.stat.get('reduce') == 4, str(pf.positions))
+    finally:
+        S._prev_close = orig_pc
 
     print('\n' + '=' * 60)
     total = PASSED[0] + len(FAILED)
