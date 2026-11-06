@@ -15,7 +15,7 @@
   7  无放缓：L 后第 5 根失效（None）
   8  有放缓：同样 4 根，wleft=1 仍可买（窗口放宽到 6 根）
   9  有放缓：第 7 根失效（None）
- 10  窗口内已经站上过 L → None（不追）
+ 10  窗口内站上过 L 后，今天自己达标仍可买（窗口内任意一天都能买）
  11  急跌：连跌 4 根累计 -14% → True；只连跌 2 根 → False
  12  量能三态：等于均量 / 适中 / 2 倍均量
  13  不创新低
@@ -175,32 +175,49 @@ def run():
     check('8c 窄幅且实体贴合 → 放缓 6 根', S.window_size(o, c, L_IDX) == 6,
           'wlen=%s' % S.window_size(o, c, L_IDX))
 
-    # 10 窗口内已站上过 L → 结构已触发，不再追
+    # 10 窗口内【站上过 L】不让结构作废：今天仍在窗口内、今天自己达标就能买
     rows10 = BASE + [bar(25.10, 25.10), bar(25.00, 25.00)]
     o, c, h, l, v = mk(rows10)
-    check('10 已触发不追', S.detect_setup(o, c, h, l, v) is None, 'close>L at idx34')
+    st = S.detect_setup(o, c, h, l, v)
+    check('10 第2天站上过L，今天(第3根)仍可买',
+          st is not None and st['wleft'] == 1, 'st=%s' % st)
 
-    print('\n[10b] 前低：出现反转那根后冻结，不再被后面的回踩拉低')
-    # 34 磨底（贴在下沿）→ 35 往上顶出 2.0%（反转那根）→ 36 回踩更深（收盘 23.90 低于此前最低 24.00）
-    rows10b = BASE + [bar(24.20, 24.20),
-                      bar(24.50, 24.70),
-                      bar(24.10, 23.90)]
+    # 10a 用户场景：第 2 天收盘在 L 上方但量能不够没买成，今天第 4 根再达标 → 仍然可以买
+    rows10a = BASE + [bar(25.10, 25.10), bar(25.00, 25.00), bar(25.20, 25.20)]
+    o, c, h, l, v = mk(rows10a)
+    st = S.detect_setup(o, c, h, l, v)
+    check('10a 第2天站上过L，今天(第4根)仍可买',
+          st is not None and st['wleft'] == 0, 'st=%s' % st)
+
+    print('\n[10b] 前低：磨底阶段小实体新低是允许的，前低跟着下移；反转之后才冻结')
+    # 34/35/36 每根都创一点新低，但实体都贴着（重合≤1%）→ 还在磨底，结构不废，前低一路下移到 23.90
+    rows10b = BASE + [bar(24.20, 24.10),
+                      bar(24.10, 23.95),
+                      bar(24.00, 23.90)]
     o, c, h, l, v = mk(rows10b)
     st = S.detect_setup(o, c, h, l, v)
-    check('10b 反转后前低冻结在反转之前',
-          st is not None and abs(st['p_low'] - 24.00) < 1e-9
+    check('10b 磨底小实体连续新低 → 结构不废，前低跟着下移到 23.90',
+          st is not None and abs(st['p_low'] - 23.90) < 1e-9,
+          'p_low=%s rev=%s' % (None if st is None else st['p_low'],
+                               S.find_reversal_idx(o, c, L_IDX)))
+    # 35 往上顶（重合 2.02%、没创新低）= 反转那根 → 前低冻结在 24.00；36 回踩到 23.90 跌破它 → 作废
+    rows10b2 = BASE + [bar(24.20, 24.10),
+                       bar(24.50, 24.70),
+                       bar(24.10, 23.90)]
+    o, c, h, l, v = mk(rows10b2)
+    check('10b2 反转之后跌破冻结前低(=止损位) → 新的下跌结构，重新数三根急跌',
+          S.detect_setup(o, c, h, l, v) is None
           and S.find_reversal_idx(o, c, L_IDX) == 35,
-          'p_low=%s rev=%s（不冻结会是 23.90）'
-          % (None if st is None else st['p_low'], S.find_reversal_idx(o, c, L_IDX)))
-    # 三根都贴在下沿、没有一根往上顶 → 没有反转，前低照旧取全部最低
+          'rev=%s c36=%.2f' % (S.find_reversal_idx(o, c, L_IDX), c[36]))
+    # 同样有反转那根，但 36 只回踩到 24.05（守住冻结的前低）→ 结构还在，前低 = 24.00
     rows10c = BASE + [bar(24.20, 24.10),
-                      bar(24.15, 24.05),
-                      bar(24.10, 23.90)]
+                      bar(24.50, 24.70),
+                      bar(24.10, 24.05)]
     o, c, h, l, v = mk(rows10c)
     st = S.detect_setup(o, c, h, l, v)
-    check('10c 没有反转那根 → 前低取全部最低',
-          st is not None and abs(st['p_low'] - 23.90) < 1e-9
-          and S.find_reversal_idx(o, c, L_IDX) is None,
+    check('10c 反转后守住冻结前低 → 结构有效，前低=24.00',
+          st is not None and abs(st['p_low'] - 24.00) < 1e-9
+          and S.find_reversal_idx(o, c, L_IDX) == 35,
           'p_low=%s rev=%s' % (None if st is None else st['p_low'],
                                S.find_reversal_idx(o, c, L_IDX)))
 
@@ -216,15 +233,18 @@ def run():
           and S.find_reversal_idx(o, c, L_IDX) is None,
           'rev=%s newlow=%s' % (S.find_reversal_idx(o, c, L_IDX),
                                 S.makes_new_low(c, L_IDX, 36)))
-    # 同样一根创新低，但如果重合没超 1%（跳空低开小实体）→ 不算新的推动，结构仍有效
+    # 同样一根创新低，但实体几乎贴住（重合 0.21%）→ 还是磨底，不算新的下跌段，前低只是跟着低到 23.90
     rows10e = BASE + [bar(24.20, 24.20),
                       bar(24.15, 24.10),
                       bar(23.95, 23.90)]
     o, c, h, l, v = mk(rows10e)
     st = S.detect_setup(o, c, h, l, v)
-    check('10e 创新低但重合≤1% → 结构不废（只是前低更低）',
-          st is not None and abs(st['p_low'] - 23.90) < 1e-9,
-          'p_low=%s' % (None if st is None else st['p_low']))
+    check('10e 创新低但重合≤1% → 算磨底，结构不废（前低降到 23.90）',
+          st is not None and abs(st['p_low'] - 23.90) < 1e-9
+          and S.find_reversal_idx(o, c, L_IDX) is None,
+          'p_low=%s rev=%s' % (None if st is None else st['p_low'],
+                               S.find_reversal_idx(o, c, L_IDX)))
+
 
     # 跳空低开、跌幅 >1% 的那根本身就是有效大阴线 → 它自己会变成新的 L，轮不到"放过"
     rows10f = BASE + [bar(24.20, 24.20),

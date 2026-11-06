@@ -649,6 +649,40 @@ def main():
     finally:
         S._prev_close = orig_pc
 
+    print('\n[场景 AB] 窗口第 2 天曾站上 L（当天量不够没买成）→ 今天第 4 根再达标，仍然买')
+    orig_fetch = S._fetch_daily
+
+    def _patch_break_on_day2():
+        def wrapped(codes, end_date, count):
+            out = orig_fetch(codes, end_date, count)
+            df = out.get(CODE)
+            if df is not None and len(df) >= 2:
+                df = df.copy()
+                # 把"昨天"(最后一根，idx 59) 的收盘抬到 L=24.90 上方 → 模拟窗口内曾站上过
+                df.iloc[len(df) - 1, df.columns.get_loc('close')] = 24.92
+                out[CODE] = df
+            return out
+        S._fetch_daily = wrapped
+
+    try:
+        ctx, pf = run_scenario('AB', now_price=25.20, now_vol=1500.0,
+                               patch=_patch_break_on_day2)
+        buys = [x for x in ORDERS if x[0] == 'buy']
+        check('AB1 站上过 L 也不再作废 → 今天照样买 1 笔', len(buys) == 1, str(ORDERS))
+    finally:
+        S._fetch_daily = orig_fetch
+
+    print('\n[场景 AC] 同一个结构只买一次：买过之后止损清仓，窗口内再达标也不回头买')
+    ctx, pf = run_scenario('AC', now_price=25.20, now_vol=1500.0)
+    check('AC1 首次买入 1 笔', len([x for x in ORDERS if x[0] == 'buy']) == 1, str(ORDERS))
+    pf.positions.clear()            # 模拟止损离场：仓位没了、entry 也清掉
+    S.g.entry.clear()
+    S.g.buy_date.clear()
+    del ORDERS[:]
+    rerun(ctx, 25.30, 1600.0)       # 次日同一结构仍然满足全部条件
+    check('AC2 同一个 L 不再买第二次',
+          len([x for x in ORDERS if x[0] == 'buy']) == 0, str(ORDERS))
+
     print('\n' + '=' * 60)
     total = PASSED[0] + len(FAILED)
     if FAILED:

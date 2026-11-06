@@ -24,13 +24,19 @@
        - 有放缓：6 根。放缓 = L 之后出现连续 3 根窄幅 K 线（视为 1 根）
          窄幅 = 今天收盘价相对昨天收盘价的偏离 ≤ 1%，收盘对收盘，不看实体大小，也不是 (开-收)/收
           另：这 3 根的实体彼此也要"重合不超过 1%"，压过 1% 视为已开始反转 → 不算放缓，窗口仍是 4 根
+       - 窗口内【任意一天】都可以是买入日：只要当天的收盘 > L 且当天量能/涨幅达标。
+         不要求是"第一次站上 L"的那天；某天站上过、但当天量能不够没买成，
+         后面的第 2/3/4 根只要自己达标，照样买（同一结构只买一次，见 ONE_TRADE_PER_SETUP）。
 4.  量能：MA5(VOL)×(1-10%) < 当日 VOL < 2 × MA10(VOL)
        ← 必须放量过 5 日均量（给 10% 容差：当日量 > 均量的 90% 就算过），且不到 2 倍 10 日均量
        （MA5/MA10 取截至前一根已收盘K线的均量；当日 VOL 用 14:55 时点的当日累计量估计全日量）
 5.  不创新低：14:55 价 ≥ P_low，P_low = 从 L 到买入前一天的最低收盘价
-        （若期间出现"反转那根"——实体重合超过 1% 且没创新低的第一根K线——则只取 L 到那根为止的最低收盘价，
-         之后更低的回踩不再下移止损位）
-        若出现"重合超 1% 又创新低"的K线 → 下跌还没走完，旧 L 作废（新的下跌结构，重新数三根急跌）
+        （磨底阶段小实体贴在下沿慢慢新低是允许的，前低跟着下移；
+         一旦出现"反转那根"——实体重合超过 1% 且没创新低的第一根K线——前低就冻结在 L 到那根之间，
+         之后回踩不再下移止损位）
+        作废（= 新的下跌结构，重新数三根急跌）的两种情形：
+        ① 反转之前出现"重合>1% 又创新低"的砸盘大阴线
+        ② 反转之后任何一根收盘跌破冻结的前低（不看重合）
 5b. 站上那根要够强：站上 L 的那根上涨K线，涨幅（相对前一天收盘）> 1%
        ← 原文"（阴线的下跌值>1%的股价，上涨的k线也要>1%）"
 6.  盈亏比：目标 = 买入价上方最近的强压力区；盈亏比 = (目标 - 买入) / (买入 - P_low) 必须 ≥ 2
@@ -115,6 +121,7 @@ NARROW_RUN   = 3        # 放缓：连续 3 根
 NARROW_OVERLAP = True   # 放缓：这 3 根彼此的实体也要【重合不超过 1%】，压过 1% 视为已开始反转 → 不算放缓
 W_NO_SLOW    = 4        # 无放缓 → 窗口 4 根
 W_SLOW       = 6        # 有放缓 → 窗口 6 根
+ONE_TRADE_PER_SETUP = True  # 同一个结构（同一个 L）只买一次：止损出局后，窗口内再满足条件也不回头买
 VOL_S        = 5        # 短均量 5 日
 VOL_L        = 10       # 长均量 10 日
 VOL_CAP      = 2.0      # 2 倍量
@@ -379,7 +386,18 @@ def detect_setup(o, c, h, l, v):
     做三件事：
       1. 找出有效大阴线 L，并确认急跌结构
       2. 确认窗口没作废：今天(T)在 L 之后第 1..wlen 根之内
-      3. 确认此前没有已经站上过 L（站过就算结构已用掉，不追）
+      3. 确认下跌没有走完（作废条件见下）
+
+    注意：窗口内【站上过 L】不再让结构作废。窗口内任意一天，只要当天收盘 > L
+    且量能/涨幅达标就能买（不要求是第一天站上那根）。窗口 = L 之后第 1..wlen 根，
+    过了窗口还没买成，这段结构就作废、重新数三根急跌。
+
+    "结构作废"三件事（都在 L 之后、到昨天为止这一段里判）：
+      ① 反转【之前】出现"实体重合>1% 又创新低"的砸盘大阴线 → 下跌还没走完
+         （磨底阶段小实体贴着下沿慢慢新低是允许的：那还是放缓，不算新结构，
+          前低跟着下移即可）
+      ② 反转【之后】任何一根收盘跌破冻结的前低（= 止损位）→ 新的下跌段，不看重合
+      ③ 窗口跑完还没达标（今天已是 L 后第 5/6 根之外）
     """
     n = len(c)
     if n < 20:
@@ -392,21 +410,25 @@ def detect_setup(o, c, h, l, v):
         return None
 
     L = float(o[Li])
-    # 结构还在不在：①站上过 L（本轮已经触发过）②出现"重合超 1% 且创新低"的K线（下跌还没结束，
-    # 那根是新的下跌结构的开始，从它重新数三根急跌；在这之前旧 L 一律不算）
-    for t in range(Li + 1, n):
-        if c[t] > L:
-            return None
-        if (not overlap_ok(o, c, t - 1, t)) and makes_new_low(c, Li, t):
-            return None
 
-    # 前低（止损位）：默认取 L 到昨天的最低收盘价；
+    # 前低（止损位）= L 到昨天的最低收盘价；
     # 一旦出现"反转那根"（重合超 1% 且没创新低），前低冻结为 L 到那根之间的最低收盘价，
-    # 之后磨底/回踩的更低收盘价不再下移止损位（否则反转之后随便一个小坑都会把止损拉低、把盈亏比算差）。
+    # 之后回踩的更低收盘价不再下移止损位（否则反转之后随便一个小坑都会把止损拉低、把盈亏比算差）。
     p_low = float(np.min(c[Li:]))
     rev = find_reversal_idx(o, c, Li, n)
     if rev is not None:
         p_low = float(np.min(c[Li:rev + 1]))
+
+    # 结构还在不在：
+    #   ① 反转之前：砸下去的大阴线（重合>1%）又创新低 → 旧 L 作废；
+    #      小实体磨底新低（重合≤1%）不算新结构，前低照上面的算法跟着下移
+    #   ② 反转之后：收盘跌破冻结的前低（= 止损位）→ 也算新的下跌段（这一条不看重合）
+    # （曾经还有一条"窗口内站上过 L 就作废"，已删除：现在窗口内任意一天都能买。）
+    for t in range(Li + 1, n):
+        if (not overlap_ok(o, c, t - 1, t)) and makes_new_low(c, Li, t):
+            return None
+        if rev is not None and t > rev and float(c[t]) < p_low:
+            return None
 
     wlen = window_size(o, c, Li, n)
     wleft = Li + wlen - n                  # 今天(索引 n)是第几根：>=0 表示还在窗口内
@@ -947,6 +969,7 @@ def initialize(context):
     # 记录表
     g.entry = {}      # code -> {'L','p_low','target','buy','rr','L_idx','buy_date'}
     g.buy_date = {}   # code -> date
+    g.done = set()    # 已买过的 (code, L_idx)：同一个结构只买一次
     g.stat = {'days': 0, 'cand': 0, 'buy': 0, 'sell_win': 0, 'sell_lose': 0,
               'skip': 0, 'reduce': 0, 'tp_part': 0}
     g.no_minute_vol = 0
@@ -994,6 +1017,8 @@ def trade_1455(context):
         except Exception:
             continue
         if st is not None:
+            if ONE_TRADE_PER_SETUP and (code, int(st['L_idx'])) in g.done:
+                continue                      # 这个结构已经买过一次（后来止损出来了），不再回头
             cands.append((code, st))
 
     g.stat['cand'] += len(cands)
@@ -1655,6 +1680,7 @@ def _do_buy(context, today, picks):
             'vol_anchor': None,      # 上次放量减仓的价格（再次减仓要 ≥ 它的 1.05 倍）
         }
         g.buy_date[code] = today
+        g.done.add((code, int(st['L_idx'])))      # 这个结构买过了，窗口内不再重复买
         g.stat['buy'] += 1
         slots -= 1
         bought += 1
@@ -1681,13 +1707,14 @@ def _do_buy(context, today, picks):
 # 至少三根K线下跌比较猛                      is_sharp_decline()：连跌≥3根且累计≥3%
 # 段内实体重合都不超过1%（贴住/跳空）        has_body_gaps()，REQUIRE_GAP 开关
 # 第一根跌幅>1%或破前低                     first_bar_sharp()，REQUIRE_FIRST_DROP 开关
-# 四根k线内完全站上                        detect_setup() 的窗口 wleft >= 0
+# 四根k线内完全站上                        detect_setup() 的窗口 wleft >= 0；窗口内任意一天达标都能买
 # 上涨的k线也要 >1%（站上那根的涨幅）        stand_gain_ok()，REQUIRE_STAND_GAIN 开关
 # 连续三根k线在1%以内算放缓                  slow_run_ok()：窗口放宽到 6 根
 # 放缓的3根也不能重合超过1%（否则是反转）    slow_run_ok() 里再过 overlap_ok()，NARROW_OVERLAP 开关
-# 同时不可以创新低                          no_new_low()：price >= p_low
+# 同时不可以创新低                          no_new_low()：price >= p_low（磨底小新低允许，反转后冻结）
 # 反转那根出现后前低冻结                    find_reversal_idx()：重合>1% 且不创新低，p_low 只取 L 到那根
-# 重合>1% 又创新低 → 新的下跌结构            detect_setup()：直接作废，重新数三根急跌（makes_new_low）
+# 作废①：反转前"重合>1% 又创新低"            detect_setup()：砸盘大阴线创新低 → 新结构（小实体磨底新低不算）
+# 作废②：反转后收盘跌破冻结前低              detect_setup()：不看重合，跌破止损位就是新结构
 # 价格到达压力区就卖出                       target_hit() 判到价；sell_decision() 决定卖多少
 # 持仓期高开在目标价之上 → 不卖等回落          target_hit()：开盘>目标 且 当日最低>目标 → 不卖（GAP_UP_HOLD）
 # 到目标价止盈改到盘中执行              handle_data()：每分钟判 到价 → 当场卖（GAP_WATCH_SELL）
@@ -1708,6 +1735,7 @@ def _do_buy(context, today, picks):
 # 压力区很近 → 目标取最近的那个              pick_target()：上方最近压力区的下沿；已在区内则不买
 # 上方没压力区 → 按 120 日高点空间兜底         fallback_target()：target = 买入+2×(买入-前低)，须 ≤ 120 日最高价
 # 成交量 > 买入当天那根K线的成交量           find_strong_zones(v0=买入当天量)
+# 同一个结构只买一次                        g.done 记 (code, L_idx)，ONE_TRADE_PER_SETUP 开关
 # 买入后遇当日量 > 2×MA10 → 减仓1/3初始      _do_sell()：vol_exceed() + reduce_shares(最初仓位)；剩余不足2手卖一半，卖完剩不足1手清仓
 # 再减要涨回1.05倍或当天涨5%                 _do_sell()：vol_anchor×REDUCE_REARM_GAIN / _prev_close()
 #
