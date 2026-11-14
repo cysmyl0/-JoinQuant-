@@ -85,7 +85,13 @@
        - 站上 20 日线（价 ≥ MA20×0.99）→ 卖到剩 1/3 最初仓位，尾巴跟 20 日线
       - 已在线下（价 < MA20×0.99）→ 当天直接全卖，不留尾巴过夜
       - 拿不到 20 日线数据 → 全卖
-       - 剩下的 1/3：收盘价【跌破 MA20×(1-1%)】就卖掉（跟随止盈）
+      - 【例外】目标价来自"120 日高点兜底"（上方一条压力区都没有，entry['target_src']）→
+        "到价时已跌破 MA20 就当天全卖"这条不适用（它配合的是"摸到压力区"），
+        照旧卖到 2/3 初始、留 1/3 尾巴；拿不到 20 日线时仍按兜底全卖
+       - 剩下的 1/3（压力区目标）：收盘价跌破 MA20×(1-1%) 就卖掉（跟随止盈）
+       - 剩下的 1/3（120 日高点兜底目标）：**先要"真的突破过" 20 日线**（某天价 > MA20，记 tail_armed）
+         → 之后收盘价跌破 MA20×(1-1%) 才清掉；
+         一直没突破过 → 跌破均线不管，只有【跌破成本价】或【放量减仓】才动
        - 卖过 2/3 之后，剩下的 1/3 仍然受【跌破前低止损】保护，并且【照样按放量减仓】
        - MA20 默认含当天（MA20_INCLUDE_TODAY=True，用 14:55 价当今天收盘）
 
@@ -128,6 +134,11 @@ VOL_CAP      = 2.0      # 2 倍量
 VOL_S_TOL    = 0.10     # 买入时对"放量过 5 日均量"的容差：当日量 > MA5×(1-10%) 即算过
 RR_MIN       = 2.0      # 盈亏比 2:1
 USE_HIGH_FALLBACK = True   # 上方找不到压力区时，用"120 日最高价"兜底：空间够 2:1 就按固定 2:1 止盈
+# 目标价的两个来源。记在 entry['target_src'] 里，卖出时要用：
+#   压力区     → 到价看 MA20：站上留尾巴 / 已跌破 → 当天全卖
+#   120日高点  → 到价【不看 MA20】：「跌破就全卖」这条不适用，一律卖到 2/3 初始、留 1/3 尾巴
+SRC_ZONE     = '压力区'
+SRC_FALLBACK = '120日高点'
 GAP_UP_HOLD  = True     # 持仓期【开盘价已在目标价之上】（跳空突破）→ 不在开盘卖，等盘中回落到目标价再卖
 GAP_WATCH_SELL = True   # 止盈挪到盘中：handle_data 每分钟盯 "到目标价" 就卖（止损/减仓仍只在 14:55）
 REQUIRE_STAND_GAIN = True  # 站上 L 的那根上涨K线，涨幅必须 > STAND_GAIN_PCT
@@ -821,12 +832,20 @@ def sell_decision(price, entry, today, buy_date, ma20=None,
     规则（优先级从上到下）：
       1) T+1 没到 → 不动
       2) 跌破前低 → 全卖（止损永远优先，包括剩下的 1/3）
-      3) 已经卖过 2/3（entry['tp2_done']）→ 价 < MA20×(1-1%) 就全卖，否则继续拿
+      3) 已经卖过 2/3（entry['tp2_done']）→ 处理剩下的 1/3 尾巴：
+           - 目标价来自压力区 → 照旧跟均线：跌破 MA20×(1-1%) 就全卖
+           - 目标价来自 120 日高点兜底（entry['target_src']==SRC_FALLBACK）→ 分两段：
+               还没站上过 MA20（没突破）→ 跌破均线【不管】，只认"跌破成本价"→ 全卖
+               （放量减仓由 `_do_sell()` 独立触发，不在这里）
+               哪天价真正站上 MA20 → 置 entry['tail_armed']=True，
+               之后等它重新跌破 MA20×(1-1%) 就全卖
       4) 到压力区（按 target_hit() 判，含跳空处理）：
            - 开盘就跳空到目标价之上 → 不卖，等盘中回落到目标价再卖
            - 开盘在目标价之下 → 盘中最高价到目标价就卖
            - 卖多少只看最初仓位：累计卖到 2/3 初始（tp_part_shares() 会抵扣已减的部分）
            - 站上 MA20（价 ≥ MA20×0.99）才留 1/3 尾巴；已跌破 → 当天全卖，不留过夜
+             【但这条"跌破就全卖"只对压力区目标生效】目标价来自 120 日高点兜底时，
+             上方没有压力区，不看均线，一律按 2/3 初始卖、留 1/3 尾巴（entry['target_src']）
            - 拿不到 MA20 数据时才全卖
       5) 时间止损（MAX_HOLD_DAYS，默认关闭）→ 全卖
 
@@ -844,10 +863,24 @@ def sell_decision(price, entry, today, buy_date, ma20=None,
 
     band = ma_band(ma20)
 
-    # 已经止盈过 2/3：剩下的 1/3 只看 20 日线（带 1% 容差）
+    # 已经止盈过 2/3：剩下的 1/3 就是"尾巴"
+    # ① 目标价来自压力区（默认）：尾巴照旧跟 20 日线 —— 跌破 MA20×(1-1%) 就清掉
+    # ② 目标价来自"120 日高点兜底"：上方没有压力区，尾巴分两段
+    #    - 还没站上过 MA20（没突破）→ 跌破均线【不管】，只认"跌破成本价"
+    #      （放量减仓在调用方 `_do_sell()` 里独立处理，不受这里影响）
+    #    - 哪天价【真正站上过 MA20】→ 记 entry['tail_armed']=True，
+    #      此后等它重新跌破 MA20×(1-1%) 就清掉
     if entry.get('tp2_done'):
-        if band is not None and price < band:
-            return 'all', '跟踪止盈:跌破20日线'
+        if entry.get('target_src') != SRC_FALLBACK:
+            if band is not None and price < band:
+                return 'all', '跟踪止盈:跌破20日线'
+        else:
+            if ma20 is not None and float(ma20) > 0 and float(price) > float(ma20):
+                entry['tail_armed'] = True
+            if entry.get('tail_armed') and band is not None and price < band:
+                return 'all', '跟踪止盈:突破后跌破20日线'
+            if not entry.get('tail_armed') and price < float(entry['buy']):
+                return 'all', '止损:跌破成本价'
         if MAX_HOLD_DAYS and (today - buy_date).days >= MAX_HOLD_DAYS:
             return 'all', '时间止损'
         return '', ''
@@ -857,16 +890,23 @@ def sell_decision(price, entry, today, buy_date, ma20=None,
         gap = (day_open is not None and entry['target'] is not None
                and float(day_open) > float(entry['target']))
         tail = '(跳空回踩)' if gap else ''
+        # 目标价来自"120 日高点兜底"：上方本来就没有压力区，"到价时已跌破 MA20 就当天全卖"
+        # 这条不适用（它是配合压力区的：摸到供给区又站不上均线才一次走干净）。
+        # 兜底票到价照旧只卖到 2/3 初始、留 1/3 尾巴；拿不到均线时仍按下面兜底全卖。
+        is_fallback = (entry.get('target_src') == SRC_FALLBACK)
         if not TP_FOLLOW_MA:
-            return 'all', '止盈:到压力区' + tail
+            return 'all', '止盈:到目标价' + tail
         if band is None:
-            return 'all', '止盈:到压力区(无20日线,全卖)' + tail
+            return 'all', '止盈:到目标价(无20日线,全卖)' + tail
         # 到目标价时已经跌破 20 日线（没站上）→ 当天就全卖，
         # 不留 1/3 过夜（否则次日 14:55 照样要清，白担一夜风险）。
-        if price < band:
+        # 【只对压力区目标生效】：兜底目标没有压力区，不看均线。
+        if (not is_fallback) and price < band:
             return 'all', '止盈:到压力区(未站上MA20,全卖)' + tail
         # 站上 20 日线：只卖到【2/3 最初仓位】，留 1/3 尾巴跟 20 日线；
         # 之前因放量减仓已经卖掉的份额算在这 2/3 里（`tp_part_shares()` 会抵扣）。
+        if is_fallback:
+            return 'part', '止盈:到120日高点(卖到剩1/3,留尾巴)' + tail
         return 'part', '止盈:到压力区(卖到剩1/3,留尾巴)' + tail
 
     if MAX_HOLD_DAYS and (today - buy_date).days >= MAX_HOLD_DAYS:
@@ -1076,14 +1116,14 @@ def trade_1455(context):
             continue
         if status == 'above':
             target = pick_target(zones, p)
-            src = '压力区'
+            src = SRC_ZONE
         else:
             # 上方一条压力区都没有 → 用"120 日最高价"兜底：空间够 2:1 就按 2:1 止盈
             if not USE_HIGH_FALLBACK:
                 continue
             high_max = float(np.max(h[-HIGH_BACK:])) if len(h) else None
             target = fallback_target(p, st['p_low'], high_max)
-            src = '120日高点'
+            src = SRC_FALLBACK
             if target is None:
                 continue
         if target is None:
@@ -1678,6 +1718,7 @@ def _do_buy(context, today, picks):
             'qty0': int(amt),        # 最初股数：减仓/止盈的份额都按它算
             'sold': 0,               # 累计已卖出股数
             'vol_anchor': None,      # 上次放量减仓的价格（再次减仓要 ≥ 它的 1.05 倍）
+            'target_src': src,       # 目标价来源：SRC_ZONE（看均线留尾巴）/ SRC_FALLBACK（到价全卖）
         }
         g.buy_date[code] = today
         g.done.add((code, int(st['L_idx'])))      # 这个结构买过了，窗口内不再重复买
@@ -1721,7 +1762,10 @@ def _do_buy(context, today, picks):
 # 止损/放量减仓只在 14:55                 handle_data() 遇到"现价≤前低"直接跳过，交给 _do_sell
 # 到压力区 → 站上MA20卖到剩1/3初始            sell_decision()：价≥MA20×0.99 返回 'part'；tp_part_shares() 抵扣已减的份额
 # 到压力区 → 已跌破MA20则当天全卖             sell_decision()：价<MA20×0.99 返回 'all'（尾巴跟不住均线，不留过夜）
-# 剩下1/3跌破20日均线再卖                    sell_decision()：tp2_done + price < ma_band()（MA20×0.99）
+# 兜底目标(120日高点)到价 → 不看均线卖2/3    sell_decision()：entry['target_src']==SRC_FALLBACK → 'part'（"跌破MA20全卖"只对压力区生效）
+# 剩下1/3尾巴：压力区目标 → 跌破20日线就清        sell_decision()：tp2_done 且 price<ma_band() → 'all'
+# 剩下1/3尾巴：兜底目标 → 先突破过20日线才启用     sell_decision()：价>MA20 置 entry['tail_armed']；之后 price<ma_band() 才全卖
+# 尾巴(兜底票)没突破过均线 → 只认跌破成本价         sell_decision()：not tail_armed 且 price<entry['buy'] → 'all'（放量减仓另算）
 # 算不够1手 / 拿不到20日线 → 全卖             tp_part_shares() 返回不足1手时兜底 'all'
 # 不能买：两倍十日成交量的K线                volume_ok()：VOL 必须 < 2×MA10(VOL)
 # 必须放量过5日均量（10%容差）              volume_ok()：VOL > MA5×(1-VOL_S_TOL)

@@ -671,10 +671,20 @@ def run():
                           ma20=27.95 / 0.99)[0] == 'part')
     check('21j 到压力区但拿不到20日线 → 全卖',
           S.sell_decision(27.95, dict(ent), d0, bd, ma20=None)[0] == 'all')
-    check('21k 卖过2/3后 跌破20日线 → 清掉剩下的1/3',
+    check('21k 压力区尾巴 跌破20日线 → 照旧清掉（不需要先突破）',
           S.sell_decision(26.00, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == 'all')
-    check('21l 卖过2/3后 仍在20日线上方 → 继续持有',
-          S.sell_decision(27.50, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == '')
+    fe = lambda **kw: dict(ent, tp2_done=True, target_src=S.SRC_FALLBACK, **kw)
+    check('21k2 兜底尾巴 从没突破过 + 仍在成本上方 → 跌破均线也不管',
+          S.sell_decision(26.00, fe(), d0, bd, ma20=26.98)[0] == '')
+    check('21k3 兜底尾巴 从没突破过 + 已跌破成本价 → 全卖（止损:跌破成本价）',
+          S.sell_decision(24.50, fe(), d0, bd, ma20=26.98)[1] == '止损:跌破成本价')
+    check('21l 兜底尾巴 站上20日线 → 打上 tail_armed、继续持有',
+          (lambda e: (S.sell_decision(27.50, e, d0, bd, ma20=26.98)[0] == ''
+                      and e.get('tail_armed') is True))(fe()))
+    check('21l2 兜底尾巴 已经突破过 → 重新跌破 MA20×0.99 就清掉',
+          S.sell_decision(26.60, fe(tail_armed=True), d0, bd, ma20=26.98)[0] == 'all')
+    check('21l3 兜底尾巴 已经突破过 → 还在均线上方 → 继续拿',
+          S.sell_decision(27.20, fe(tail_armed=True), d0, bd, ma20=26.98)[0] == '')
     check('21m 卖过2/3后 跌破前低 → 照样止损',
           S.sell_decision(23.90, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == 'all')
     check('21n T+1 当天不能卖',
@@ -687,12 +697,32 @@ def run():
     finally:
         S.TP_FOLLOW_MA = f0
 
+    # ---- 120 日高点兜底的目标价：不看 MA20（"跌破均线就全卖"这条不适用） ----
+    fent = dict(ent, target=27.60, target_src=S.SRC_FALLBACK)
+    check('21p 兜底目标到价 + 站上20日线 → 卖 2/3 留尾巴',
+          S.sell_decision(27.60, dict(fent), d0, bd, ma20=26.98)[0] == 'part')
+    check('21p2 兜底目标到价 + 已跌破20日线 → 仍然卖 2/3（不因均线全卖）',
+          S.sell_decision(27.60, dict(fent), d0, bd, ma20=28.50)[0] == 'part')
+    check('21p3 兜底目标到价的 reason 说明是 120 日高点',
+          '120日高点' in S.sell_decision(27.60, dict(fent), d0, bd,
+                                          ma20=28.50)[1])
+    check('21q 兜底目标到价 + 拿不到均线 → 全卖（这条不变）',
+          S.sell_decision(27.60, dict(fent), d0, bd, ma20=None)[0] == 'all')
+    check('21r 兜底目标没到 → 不动',
+          S.sell_decision(27.50, dict(fent), d0, bd, ma20=26.98)[0] == '')
+    check('21s 压力区目标 + 已跌破20日线 → 当天全卖（这条只给压力区用）',
+          S.sell_decision(27.95, dict(ent, target_src=S.SRC_ZONE), d0, bd,
+                          ma20=28.50)[0] == 'all')
+    check('21t 兜底目标但已跌破前低 → 止损优先',
+          S.sell_decision(23.90, dict(fent), d0, bd, ma20=26.98)[1] ==
+          '止损:跌破前低')
+
     print('\n[22] 20 日均线跌破容差 1%（价 < MA20×0.99 才算跌破）')
     check('22a 容差线 = MA20×0.99', abs(S.ma_band(26.98) - 26.7102) < 1e-6,
           str(S.ma_band(26.98)))
-    check('22b 尾巴价 26.80（在容差内）→ 继续持有',
+    check('22b 压力区尾巴 价 26.80（在容差内）→ 继续持有',
           S.sell_decision(26.80, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == '')
-    check('22c 尾巴价 26.70（跌破容差线 26.71）→ 清仓',
+    check('22c 压力区尾巴 价 26.70（跌破容差线 26.71）→ 清仓',
           S.sell_decision(26.70, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == 'all')
     check('22d 到压力区时价 27.95 在均线 28.00 下方但只差 0.18% → 仍卖 2/3',
           S.sell_decision(27.95, dict(ent), d0, bd, ma20=28.00)[0] == 'part')
@@ -702,7 +732,8 @@ def run():
     try:
         S.MA20_TOL = 0.02
         check('22f 容差改成 2% → 26.60 不再算跌破（26.44 以下才算）',
-              S.sell_decision(26.60, dict(ent, tp2_done=True), d0, bd, ma20=26.98)[0] == '')
+              S.sell_decision(26.60, dict(ent, tp2_done=True, target_src=S.SRC_FALLBACK,
+                                          tail_armed=True), d0, bd, ma20=26.98)[0] == '')
     finally:
         S.MA20_TOL = t0
 

@@ -264,7 +264,7 @@ def run_scenario(name, now_price, now_vol, cash=1000000.0,
 
 
 def run_hold(now_price, now_vol, shares=1000, target=30.0, p_low=22.50, tp2=False,
-             day_open=None, day_high=None, day_low=None):
+             day_open=None, day_high=None, day_low=None, src=None):
     """已持仓场景：先跑一遍初始流程（把 g 初始化好），再注入昨天的持仓，重跑一次。"""
     ctx, pf = run_scenario('hold', now_price, now_vol)
     if day_open is not None:
@@ -281,6 +281,8 @@ def run_hold(now_price, now_vol, shares=1000, target=30.0, p_low=22.50, tp2=Fals
                        'qty0': int(shares), 'sold': 0, 'vol_anchor': None}
     if tp2:
         S.g.entry[CODE]['tp2_done'] = True
+    if src is not None:
+        S.g.entry[CODE]['target_src'] = src
     S.g.buy_date[CODE] = datetime.date(2024, 5, 30)
     S.g.stat['reduce'] = 0
     S.g.stat['tp_part'] = 0
@@ -387,10 +389,27 @@ def main():
     check('K3 记下已止盈 2/3', e is not None and e.get('tp2_done') is True, str(e))
     check('K4 计数 tp_part=1', S.g.stat.get('tp_part') == 1, str(S.g.stat))
 
-    print('\n[场景 L] 剩下 1/3 跌破 20 日线(26.00 < 26.98) → 清掉')
+    print('\n[场景 L] 压力区尾巴 跌破 20 日线(26.00 < 26.98) → 照旧清掉')
     pf2 = rerun(ctx, 26.00, 1500.0)
     check('L1 清空剩余持仓', CODE not in pf2.positions, str(pf2.positions))
     check('L2 卖出记录被移除', CODE not in S.g.entry, str(list(S.g.entry)))
+
+    print('\n[场景 LA] 兜底尾巴：没突破过均线 → 跌破 26.98 也不卖；先站上再跌破才清')
+    ctx, pf = run_hold(now_price=27.60, now_vol=1500.0, shares=1000,
+                       target=27.60, src=S.SRC_FALLBACK)
+    pfA1 = rerun(ctx, 26.00, 1500.0)
+    check('LA1 没突破过均线 → 不卖（仍在成本 25.00 上方）',
+          pfA1.positions.get(CODE) is not None
+          and pfA1.positions[CODE].total_amount == 400, str(pfA1.positions))
+    pfA2 = rerun(ctx, 27.50, 1500.0)
+    check('LA2 站上均线只打标记，不卖',
+          pfA2.positions[CODE].total_amount == 400
+          and S.g.entry[CODE].get('tail_armed') is True, str(S.g.entry.get(CODE)))
+    pfA3 = rerun(ctx, 26.00, 1500.0)
+    check('LA3 突破过之后再跌破均线 → 清仓',
+          pfA3.positions.get(CODE) is None
+          or pfA3.positions[CODE].total_amount == 0, str(pfA3.positions))
+    check('LA4 卖出记录被移除', CODE not in S.g.entry, str(list(S.g.entry)))
 
     print('\n[场景 M] 到压力区(26.50) 但已跌破20日线×0.99(26.60 < 26.71) → 当天全卖')
     ctx, pf = run_hold(now_price=26.60, now_vol=1500.0, shares=1000, target=26.50)
@@ -477,6 +496,22 @@ def main():
           e is not None and abs(e['target'] - 27.60) < 1e-6, str(e))
     check('T3 盈亏比正好 2:1（浮点容差内）',
           e is not None and abs(e['rr'] - 2.0) < 1e-6, str(e and e['rr']))
+    check('T4 目标价来源记成 120日高点（卖出时用它决定"不看均线"）',
+          e is not None and e.get('target_src') == S.SRC_FALLBACK, str(e))
+
+    print('\n[场景 T2] 兜底目标到价 → 不看均线，照旧卖到 2/3 初始、留 1/3 尾巴')
+    ctx, pf = run_hold(now_price=27.60, now_vol=1500.0, shares=1000,
+                       target=27.60, p_low=24.00, src=S.SRC_FALLBACK)
+    sells = [x for x in ORDERS if x[0] == 'sell']
+    check('T2-1 下的是减仓单（order_target 到 400 股）',
+          len(sells) == 1 and sells[0][-1] == 400, str(ORDERS))
+    check('T2-2 剩 400 股、entry 仍保留、tp2_done 已打上',
+          pf.positions.get(CODE) is not None
+          and pf.positions[CODE].total_amount == 400
+          and CODE in S.g.entry and S.g.entry[CODE].get('tp2_done') is True,
+          str(pf.positions))
+    check('T2-3 记的是"止盈减仓"统计',
+          S.g.stat.get('tp_part', 0) == 1, str(S.g.stat))
 
     print('\n[场景 U] 上方没压力区，但 120 日高点也够不到 2:1 的目标 → 不买')
     orig_zones = S.find_strong_zones
